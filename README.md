@@ -2,9 +2,9 @@
 
 A camera app with face filters, built as an installable PWA like
 [News Stack](https://github.com/joek670/newsstack-v3-pwa). Choose a reference
-photo and take only the features you want from it, such as the eyes, onto the
-live face. Or describe a look in words: "blue eyes, soft skin, a little
-warmer".
+photo and the camera gives your face its look: its makeup, lipstick, blush,
+skin tone and eye colour, on your own features. Or describe a look in words:
+"blue eyes, soft skin, a little warmer".
 
 Face tracking and every filter run on the phone. No frame, photo, or shot is
 sent anywhere. The optional "Describe a look" interpreter receives the typed
@@ -15,12 +15,17 @@ text only.
 - **Camera:** live preview, front and back. The front camera view is mirrored.
   Capture saves what is on screen as a JPEG. Tap a shot to share it or save it
   to Photos. Shots are kept only until the tab closes.
-- **From the reference photo:** choose any of whole face, eyes, brows, nose,
-  and lips. Only those features change, with soft edges. **Live lighting**
-  (the default) keeps the reference's detail but takes light and skin tone
-  from the live face, so the feature fits the scene. **Photo colours** keeps
-  the reference's own colours. The photo is kept in this browser (IndexedDB)
-  and is still set after a relaunch.
+- **From the reference photo:** choose the areas (whole face, eyes, brows,
+  nose, lips) and how the photo is used:
+  - **Look** (the default): the photo works as a filter. Your face takes its
+    makeup, lipstick, blush, skin tone and iris colour, and keeps its own
+    features, expression and lighting. Nothing of the photo's face is drawn.
+  - **Features**: a face swap. The photo's own eyes, nose and so on are drawn
+    over yours, relit to match the camera (**Live lighting**) or in the
+    photo's own colours (**Photo colours**).
+
+  The photo is kept in this browser (IndexedDB) and is still set after a
+  relaunch.
 - **Edits, no reference needed:** eye colour, lip colour, skin smoothing, and
   eye size. A colour grade (warmth, brightness, contrast, saturation) applies
   to the whole image.
@@ -41,8 +46,15 @@ that fill the eye openings, which MediaPipe leaves open) and redraws the live
 face through it each frame in WebGL. One pass does all the face work:
 
 - **Feature masks:** each feature's outline is drawn into a mask and blurred,
-  so a transfer changes only that feature and fades out at its edge.
-- **Live lighting:** the reference is divided by a blurred copy of itself,
+  so the photo changes only the chosen areas and fades out at their edges.
+- **Look:** the photo and the camera image are both blurred to a scale where
+  makeup, lipstick, blush and skin tone survive but eyes, pores and feature
+  shapes do not. The live face is recoloured by the ratio of the two, so it
+  keeps all its own detail. Darkening transfers at half strength, measured
+  against each face's average, so a darker photo does not darken you. The
+  eye openings are left out, and the irises take the photo's measured iris
+  colour instead.
+- **Features, live lighting:** the reference is divided by a blurred copy of itself,
   which leaves its detail, and multiplied by a blurred copy of the live face,
   which supplies the live light. Brightness only; skin tone gets one face-wide
   correction, so strong local colour (eyeshadow, lipstick) does not tint the

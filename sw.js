@@ -8,7 +8,7 @@
  * phone should download once, not on every launch. Caching them is what
  * makes the app work with no signal after the first good load.
  */
-const SHELL = 'facecam-shell-3';
+const SHELL = 'facecam-shell-4';
 const MODEL = 'facecam-model-1';
 const ASSETS = [
   './', './index.html', './app.js', './face.js', './theme.js', './settings.js',

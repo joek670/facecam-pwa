@@ -12,7 +12,7 @@ const els = {
   refpick: $('refpick'), refthumb: $('refthumb'), reflabel: $('reflabel'), clearref: $('clearref'),
   notice: $('notice'), shots: $('shots'), noshots: $('noshots'),
   lookform: $('lookform'), look: $('look'), apply: $('apply'), via: $('via'), said: $('said'),
-  regions: $('regions'), lighting: $('lighting'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
+  regions: $('regions'), lighting: $('lighting'), lightingrow: $('lightingrow'), refMode: $('refMode'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
   showMesh: $('showMesh'), reset: $('reset'),
 };
 
@@ -37,7 +37,13 @@ function notice(msg, isErr = false) {
 
 const SETTINGS_KEY = 'facecam-settings';
 let settings = { ...DEFAULTS };
-try { settings = { ...DEFAULTS, ...clean(JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')) }; } catch (e) {}
+try {
+  const saved = clean(JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'));
+  // Saved before Look mode existed: those regions were picked for a face
+  // swap, so start Look mode from its own default instead.
+  if (!('refMode' in saved)) delete saved.regions;
+  settings = { ...DEFAULTS, ...saved };
+} catch (e) {}
 
 // [key, label, container, signed]. Signed sliders run -100..100 around 0.
 const SLIDERS = [
@@ -80,6 +86,7 @@ function buildControls() {
     els.regions.append(b);
   }
   els.lighting.addEventListener('change', () => setSettings({ lighting: els.lighting.value }));
+  els.refMode.addEventListener('change', () => setSettings({ refMode: els.refMode.value }));
   els.eyeColor.addEventListener('input', () => setSettings({ eyeColor: els.eyeColor.value,
     ...(settings.eyeAmt === 0 ? { eyeAmt: 0.6 } : {}) }));
   els.lipColor.addEventListener('input', () => setSettings({ lipColor: els.lipColor.value,
@@ -99,6 +106,9 @@ function syncControls(skip) {
   }
   for (const b of els.regions.children) b.setAttribute('aria-pressed', settings.regions.includes(b.dataset.region));
   els.lighting.value = settings.lighting;
+  els.refMode.value = settings.refMode;
+  // Live lighting vs photo colours only means something for a face swap.
+  els.lightingrow.classList.toggle('hide', settings.refMode !== 'features');
   els.eyeColor.value = settings.eyeColor;
   els.lipColor.value = settings.lipColor;
   els.showMesh.checked = settings.showMesh;
@@ -321,14 +331,15 @@ function loop() {
       state.liveMean = meanColor(v, pts, v.videoWidth, v.videoHeight, scratch) || state.liveMean;
     }
     let target = [1, 1, 1];
+    let lumNorm = 1;
     if (state.refMean && state.liveMean) {
+      const lum = c => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+      // Look mode: how much brighter the photo's face is overall, so only
+      // local darkening (makeup, contour) transfers, not the photo's exposure.
+      lumNorm = clamp(lum(state.refMean) / Math.max(1, lum(state.liveMean)), 0.3, 3);
       const ratio = state.liveMean.map((l, i) => l / Math.max(1, state.refMean[i]));
       if (settings.lighting === 'photo') target = ratio.map(r => clamp(r, 0.6, 1.6));
-      else {
-        const lum = c => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
-        const k = lum(state.refMean) / Math.max(1, lum(state.liveMean));
-        target = ratio.map(r => clamp(r * k, 0.8, 1.25));
-      }
+      else target = ratio.map(r => clamp(r * lumNorm, 0.8, 1.25));
     }
     state.gain = state.gain.map((g, i) => g + (target[i] - g) * 0.15);
 
@@ -336,12 +347,15 @@ function loop() {
       mirror: state.facing === 'user',
       points: pts,
       gain: state.gain,
+      lumNorm,
       s: renderSettings(),
     });
+    const areas = settings.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ');
     els.status.textContent = !pts ? 'Looking for a face…'
       : !state.refPoints ? 'Face found.'
-      : !settings.regions.length ? 'Face found. No features chosen from the photo.'
-      : `From the photo: ${settings.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ')}.`;
+      : !settings.regions.length ? 'Face found. No areas chosen from the photo.'
+      : settings.refMode === 'look' ? `The photo's look on: ${areas}.`
+      : `The photo's features: ${areas}.`;
     state.frame++;
   }
   if (state.stream) requestAnimationFrame(loop);

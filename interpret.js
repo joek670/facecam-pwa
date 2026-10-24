@@ -18,7 +18,7 @@ const COLORS = Object.entries({
   orange: '#e07020', black: '#202020',
 }).sort((a, b) => b[0].length - a[0].length);
 
-const PHOTO = /\b(reference|photo|picture|pic|their|his|her|swap|copy|transfer|like the)\b/;
+const PHOTO = /\b(reference|photo|picture|pic|their|his|her|swap|copy|transfer|like the|makeup|make-up)\b/;
 
 const REGION_WORDS = [
   [/\b(whole face|full face|face ?swap|entire face|face)\b/, 'face'],
@@ -66,6 +66,8 @@ export function parseLocal(text) {
   for (const part of all.split(/[,.;\n]/)) {
     const photo = PHOTO.test(part);
     if (photo) {
+      if (/\b(swap|features?|transfer|their (face|eyes|nose|lips))\b/.test(part)) patch.refMode = 'features';
+      else if (/\b(look|makeup|make-up|style|vibe|tone)\b/.test(part)) patch.refMode = 'look';
       const regions = REGION_WORDS.filter(([re]) => re.test(part)).map(([, r]) => r);
       if (regions.length) {
         patch.regions = /\b(no|without|remove)\b/.test(part) ? [] : regions;

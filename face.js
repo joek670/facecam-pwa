@@ -7,11 +7,13 @@
  *
  * Every frame, the live face is redrawn through the mesh. That one pass does
  * all the face work:
- *   - transfer: the chosen features (eyes, brows, nose, lips, or the whole
- *     face) come from the reference photo, cut by a soft mask so only those
- *     features change. In "live lighting" mode the reference keeps only its
- *     detail and takes its light and skin tone from the live face, so it sits
- *     in the scene instead of looking pasted on.
+ *   - the reference photo, in one of two modes, limited by a soft mask to
+ *     the chosen areas (whole face, eyes, brows, nose, lips):
+ *       Look (the default) recolours the live face with the photo's colours:
+ *       makeup, lipstick, blush, skin tone, iris colour. The live face keeps
+ *       its own features; nothing of the photo's face is drawn.
+ *       Features draws the photo's own features over the live ones (a face
+ *       swap), relit to match the live face.
  *   - edits with no reference: skin smoothing, lip colour, eye colour, and
  *     eye size (a warp of the mesh points around each eye).
  *   - a colour grade (warmth, brightness, contrast, saturation), applied to
@@ -308,6 +310,38 @@ function iris(pts, c, W, H) {
   return [cx, cy, r / 4];
 }
 
+// Look mode's blur, in face widths: wide enough to remove eyes, pores and
+// feature shapes, narrow enough to keep eyeliner, lipstick edges and blush.
+const LOOK_BLUR = 1 / 40;
+
+/** Mean colour of both irises in an image, rgb 0..1; the pupil and rim left out. */
+function irisColor(image, points) {
+  const c = document.createElement('canvas');
+  c.width = image.width;
+  c.height = image.height;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0);
+  let r = 0, g = 0, b = 0, n = 0;
+  for (const k of [468, 473]) {
+    const cx = points[k].x * c.width, cy = points[k].y * c.height;
+    let rad = 0;
+    for (let i = 1; i <= 4; i++) rad += Math.hypot((points[k + i].x - points[k].x) * c.width, (points[k + i].y - points[k].y) * c.height);
+    rad /= 4;
+    const x0 = Math.max(0, Math.floor(cx - rad)), y0 = Math.max(0, Math.floor(cy - rad));
+    const size = Math.max(1, Math.ceil(rad * 2));
+    const px = ctx.getImageData(x0, y0, size, size).data;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const d = Math.hypot(x0 + x - cx, y0 + y - cy) / Math.max(rad, 1);
+        if (d < 0.45 || d > 0.85) continue;
+        const i = (y * size + x) * 4;
+        r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
+      }
+    }
+  }
+  return n ? [r / n / 255, g / n / 255, b / n / 255] : [0.3, 0.2, 0.15];
+}
+
 function faceWidth(points, W, H) {
   return Math.hypot((points[CHEEK_L].x - points[CHEEK_R].x) * W, (points[CHEEK_L].y - points[CHEEK_R].y) * H);
 }
@@ -411,6 +445,10 @@ uniform vec2 vsize;
 uniform float hasRef;
 uniform float blend;
 uniform float lighting;
+uniform float lookMode;
+uniform float lumNorm;
+uniform float irisOn;
+uniform vec3 refIris;
 uniform float smoothAmt;
 uniform float lipAmt;
 uniform float eyeAmt;
@@ -450,7 +488,31 @@ void main() {
     c = mix(c, sm, smoothAmt * texture2D(maskS, dp).r * keep);
   }
 
-  if (hasRef > 0.5) {
+  vec2 feat = texture2D(maskX, dp).rg;
+  vec2 px = dp * vsize;
+  float iris = max(irisRing(iris0, px), irisRing(iris1, px));
+
+  if (hasRef > 0.5 && lookMode > 0.5) {
+    // Look: take the photo's colour, not its pixels. Both images are blurred
+    // to a scale where makeup, lipstick, blush and skin tone survive but eyes,
+    // pores and the shape of a nose do not, and the live face is recoloured
+    // by their ratio. The live face keeps its own features and detail.
+    vec3 rl = texture2D(refLow, uv).rgb;
+    vec3 ll = texture2D(liveLow, lp).rgb;
+    float lr = max(dot(rl, LUMA), 0.03);
+    float lv = max(dot(ll, LUMA), 0.03);
+    vec3 chroma = (max(rl, vec3(0.01)) / lr) / (max(ll, vec3(0.01)) / lv);
+    // Darkness (eyeshadow, contour) transfers at half strength, measured
+    // against the faces' average brightness, so a darker photo does not
+    // darken the live face and the photo's own shadows mostly stay behind.
+    float shade = sqrt(clamp(lr / lv / lumNorm, 0.6, 1.5));
+    vec3 looked = clamp(c * clamp(chroma, 0.4, 2.5) * shade, 0.0, 1.0);
+    // The eye openings are left out: a gaze that differs from the photo's
+    // would put its iris colour on the whites. The iris gets the photo's
+    // iris colour on the live iris instead.
+    c = mix(c, looked, blend * texture2D(maskT, dp).r * (1.0 - feat.g));
+    if (irisOn > 0.5) c = tint(c, refIris, blend * feat.g * iris, 0.7);
+  } else if (hasRef > 0.5) {
     vec3 r = texture2D(ref, uv).rgb;
     vec3 rc;
     if (lighting > 0.5) {
@@ -468,12 +530,8 @@ void main() {
     c = mix(c, clamp(rc, 0.0, 1.0), blend * texture2D(maskT, dp).r);
   }
 
-  vec2 feat = texture2D(maskX, dp).rg;
   if (lipAmt > 0.0) c = tint(c, lipColor, lipAmt * feat.r, 0.35);
-  if (eyeAmt > 0.0) {
-    vec2 px = dp * vsize;
-    c = tint(c, eyeColor, eyeAmt * feat.g * max(irisRing(iris0, px), irisRing(iris1, px)), 0.7);
-  }
+  if (eyeAmt > 0.0) c = tint(c, eyeColor, eyeAmt * feat.g * iris, 0.7);
 
   gl_FragColor = vec4(applyGrade(c), va);
 }`;
@@ -640,8 +698,10 @@ export class Renderer {
   }
 
   /**
-   * The reference photo and its 478 points. Also keeps a blurred copy: in
-   * live-lighting mode the shader divides it out to get the reference detail.
+   * The reference photo and its 478 points. Also keeps two blurred copies:
+   * Features mode divides one out to get the reference detail; Look mode
+   * reads its colours from the other, blurred less so makeup survives. And
+   * the mean iris colour, for Look mode's eyes.
    */
   setReference(image, points) {
     const gl = this.gl;
@@ -654,11 +714,16 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, tc, gl.STATIC_DRAW);
 
     const W = image.width, H = image.height;
-    const low = this.target('refLow', W / 4, H / 4);
+    const fw = faceWidth(points, W, H);
     const tmp = this.target('refTmp', W / 4, H / 4);
+    const low = this.target('refLow', W / 4, H / 4);
     this.copy(this.refTex, low);
-    this.blur(low, tmp, faceWidth(points, W, H) / 16 / 4);
+    this.blur(low, tmp, fw / 16 / 4);
+    const look = this.target('refLook', W / 4, H / 4);
+    this.copy(this.refTex, look);
+    this.blur(look, tmp, fw * LOOK_BLUR / 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.refIris = irisColor(image, points);
     this.hasRef = true;
   }
 
@@ -666,8 +731,8 @@ export class Renderer {
 
   /**
    * One frame.
-   * f: { mirror, points (478 live points or null), gain, s (settings) }
-   * s: { regions[], blend, lighting ('live'|'photo'), smooth, eyeSize,
+   * f: { mirror, points (478 live points or null), gain, lumNorm, s (settings) }
+   * s: { regions[], blend, refMode ('look'|'features'), lighting ('live'|'photo'), smooth, eyeSize,
    *      eyeColor [r,g,b], eyeAmt, lipColor [r,g,b], lipAmt,
    *      warmth, brightness, contrast, saturation, showMesh }
    */
@@ -682,6 +747,7 @@ export class Renderer {
 
     const pts = f.points;
     const transfer = this.hasRef && s.blend > 0 && s.regions.length > 0;
+    const look = transfer && s.refMode === 'look';
     let irisA = [0, 0, 0], irisB = [0, 0, 0];
     if (pts) {
       const d = displace(pts, s.eyeSize, W, H, this.disp);
@@ -690,7 +756,11 @@ export class Renderer {
       const Pq = i => [d[i * 2] * W / 4, d[i * 2 + 1] * H / 4];
       const Ph = i => [d[i * 2] * W / 2, d[i * 2 + 1] * H / 2];
 
-      if (transfer && s.lighting === 'live') {
+      if (look) {
+        const low = this.target('liveLook', W / 4, H / 4);
+        this.copy(this.videoTex, low);
+        this.blur(low, this.target('tmpQ', W / 4, H / 4), fw * LOOK_BLUR / 4);
+      } else if (transfer && s.lighting === 'live') {
         const low = this.target('liveLow', W / 4, H / 4);
         this.copy(this.videoTex, low);
         this.blur(low, this.target('tmpQ', W / 4, H / 4), fw / 16 / 4);
@@ -710,7 +780,7 @@ export class Renderer {
         this.upload(this.canvases.transfer, m);
         this.blur(m, this.target('tmpQ', W / 4, H / 4), 0.022 * fw / 4);
       }
-      if (s.lipAmt > 0 || s.eyeAmt > 0) {
+      if (s.lipAmt > 0 || s.eyeAmt > 0 || look) {
         const c = this.canvases.feature;
         drawFeatureMask(c, Math.round(W / 2), Math.round(H / 2), Ph);
         gl.bindTexture(gl.TEXTURE_2D, this.featureTex);
@@ -746,8 +816,9 @@ export class Renderer {
     this.useProgram(p);
     const T = this.targets;
     const units = [
-      ['video', this.videoTex], ['liveLow', T.liveLow?.tex], ['liveSmooth', T.liveSmooth?.tex],
-      ['ref', this.refTex], ['refLow', T.refLow?.tex], ['maskT', T.maskT?.tex],
+      ['video', this.videoTex], ['liveLow', (look ? T.liveLook : T.liveLow)?.tex],
+      ['liveSmooth', T.liveSmooth?.tex], ['ref', this.refTex],
+      ['refLow', (look ? T.refLook : T.refLow)?.tex], ['maskT', T.maskT?.tex],
       ['maskS', T.maskS?.tex], ['maskX', this.featureTex],
     ];
     units.forEach(([name, tex], i) => {
@@ -761,6 +832,10 @@ export class Renderer {
     gl.uniform1f(this.u(p, 'hasRef'), transfer ? 1 : 0);
     gl.uniform1f(this.u(p, 'blend'), s.blend);
     gl.uniform1f(this.u(p, 'lighting'), s.lighting === 'live' ? 1 : 0);
+    gl.uniform1f(this.u(p, 'lookMode'), look ? 1 : 0);
+    gl.uniform1f(this.u(p, 'lumNorm'), f.lumNorm || 1);
+    gl.uniform1f(this.u(p, 'irisOn'), look && (s.regions.includes('eyes') || s.regions.includes('face')) ? 1 : 0);
+    gl.uniform3fv(this.u(p, 'refIris'), this.refIris || [0.3, 0.2, 0.15]);
     gl.uniform1f(this.u(p, 'smoothAmt'), s.smooth);
     gl.uniform1f(this.u(p, 'lipAmt'), s.lipAmt);
     gl.uniform1f(this.u(p, 'eyeAmt'), s.eyeAmt);

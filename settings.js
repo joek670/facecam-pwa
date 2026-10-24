@@ -8,7 +8,10 @@
 import { REGIONS } from './face.js';
 
 export const DEFAULTS = Object.freeze({
-  regions: ['eyes', 'brows'],
+  // 'look': recolour the live face with the photo's makeup and colour.
+  // 'features': draw the photo's own features over the live ones.
+  refMode: 'look',
+  regions: ['face'],
   blend: 0.85,
   lighting: 'live',
   eyeColor: '#3f7fd0',
@@ -53,6 +56,8 @@ export function clean(patch) {
       out[k] = v.toLowerCase();
     } else if (k === 'lighting' && (v === 'live' || v === 'photo')) {
       out[k] = v;
+    } else if (k === 'refMode' && (v === 'look' || v === 'features')) {
+      out[k] = v;
     } else if (k === 'showMesh' && typeof v === 'boolean') {
       out[k] = v;
     } else if (k === 'regions' && Array.isArray(v)) {
@@ -69,6 +74,7 @@ const signed = v => (v > 0 ? '+' : '') + Math.round(v * 100);
 export function describe(patch) {
   const lines = [];
   const p = patch;
+  if ('refMode' in p) lines.push(p.refMode === 'look' ? "The photo's look (colour and makeup)" : "The photo's features (face swap)");
   if ('regions' in p) lines.push(p.regions.length
     ? `From the photo: ${p.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ')}` : 'Nothing from the photo');
   if ('blend' in p) lines.push(`Blend ${pct(p.blend)}`);

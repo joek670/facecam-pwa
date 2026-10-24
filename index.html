@@ -141,9 +141,13 @@ background:#000}
 
   <details class="panel" open>
     <summary>From the reference photo</summary>
-    <div class="chips" id="regions" role="group" aria-label="Features to take from the photo"></div>
+    <label>Use its <select id="refMode">
+      <option value="look">Look: makeup and colour</option>
+      <option value="features">Features: face swap</option>
+    </select></label>
+    <div class="chips" id="regions" role="group" aria-label="Areas to take from the photo"></div>
     <div id="refsliders"></div>
-    <label>Colour <select id="lighting">
+    <label id="lightingrow">Colour <select id="lighting">
       <option value="live">Live lighting</option>
       <option value="photo">Photo colours</option>
     </select></label>
