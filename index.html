@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Face Cam</title>
+<meta name="theme-color" content="#0b0d0f">
+<meta name="description" content="Camera with a reference-photo face filter. Face tracking runs on the phone; nothing is uploaded.">
+<!-- The model and WASM come from two CDNs; nothing else leaves the page.
+     blob: covers captured shots and the reference thumbnail. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; img-src 'self' blob: data:; media-src 'self' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<!-- Safari reads these, not the manifest, when you Add to Home Screen. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Face Cam">
+<link rel="apple-touch-icon" href="icon-180.png">
+<!-- Blocking on purpose: it sets the theme before first paint. -->
+<script src="theme.js"></script>
+<style>
+:root{color-scheme:light;--bg:#ffffff;--panel:#eef1f3;--panel2:#e3e8eb;--line:#cfd7dc;
+--text:#12171b;--dim:#56626b;--accent:#1d7a70;--accent-text:#ffffff;--warn:#8a5a00;--warn-bg:#fff4dc;
+--err:#b3261e}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
+--bg:#0b0d0f;--panel:#14181c;--panel2:#1b2126;--line:#2a3339;--text:#e9eef1;--dim:#93a1aa;
+--accent:#5cc4b8;--accent-text:#06211e;--warn:#ffc46b;--warn-bg:#2a1f0c;--err:#ff8a80}}
+:root[data-theme="dark"]{color-scheme:dark;
+--bg:#0b0d0f;--panel:#14181c;--panel2:#1b2126;--line:#2a3339;--text:#e9eef1;--dim:#93a1aa;
+--accent:#5cc4b8;--accent-text:#06211e;--warn:#ffc46b;--warn-bg:#2a1f0c;--err:#ff8a80}
+*{box-sizing:border-box}
+html,body{background:var(--bg)}
+body{margin:0;color:var(--text);
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+-webkit-text-size-adjust:100%}
+header{display:flex;align-items:center;gap:10px;justify-content:space-between;
+padding:calc(env(safe-area-inset-top) + 10px) 16px 10px;border-bottom:1px solid var(--line)}
+.brand b{font-size:19px;letter-spacing:-.3px;display:block;line-height:1.2}
+.brand span{font-size:12.5px;color:var(--dim)}
+main{max-width:720px;margin:0 auto;padding:12px 16px calc(env(safe-area-inset-bottom) + 32px)}
+button,select,.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+border-radius:10px;padding:9px 12px;font:inherit;font-size:15px;min-height:44px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent);font-weight:600}
+.stage{position:relative;background:#000;border-radius:14px;overflow:hidden;
+min-height:240px;display:flex;align-items:center;justify-content:center}
+.stage canvas{display:block;max-width:100%;max-height:68svh;width:auto;height:auto}
+.stage video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.stage .over{position:absolute;inset:auto 0 0 0;padding:8px 12px;font-size:13px;color:#e9eef1;
+background:linear-gradient(transparent,rgba(0,0,0,.6));pointer-events:none}
+.stage .start{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:10px;color:#e9eef1;text-align:center;padding:16px}
+.stage .start p{margin:0;font-size:14px;color:#b9c4cb;max-width:30ch}
+.flash{animation:flash .25s ease-out}
+@keyframes flash{from{filter:brightness(2.2)}to{filter:none}}
+.shutter{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;margin:14px 0}
+.shutter .left{justify-self:start;display:flex;align-items:center;gap:8px}
+.shutter .right{justify-self:end}
+.snap{width:68px;height:68px;border-radius:50%;padding:0;border:4px solid var(--text);
+background:var(--accent);min-height:0}
+.snap:active{transform:scale(.94)}
+.ref{display:flex;align-items:center;gap:8px}
+.ref img{width:44px;height:44px;border-radius:10px;object-fit:cover;border:1px solid var(--line)}
+.ref input{display:none}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px;
+display:grid;gap:12px}
+.panel label{display:flex;align-items:center;gap:10px;font-size:15px}
+.panel input[type=range]{flex:1;accent-color:var(--accent);min-height:32px}
+.panel input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
+.panel .val{min-width:3.2em;text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
+.notice{background:var(--warn-bg);border:1px solid var(--line);color:var(--warn);
+border-radius:12px;padding:11px 13px;margin:12px 0 0;font-size:14px}
+.notice.err{color:var(--err)}
+h2{font-size:16px;margin:22px 0 8px}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.shots button{padding:0;border-radius:10px;overflow:hidden;min-height:0;aspect-ratio:3/4;
+background:#000}
+.shots img{width:100%;height:100%;object-fit:cover;display:block}
+.empty,.foot{color:var(--dim);font-size:13.5px}
+.foot{margin-top:22px;border-top:1px solid var(--line);padding-top:12px}
+.hide{display:none!important}
+</style></head><body>
+<header>
+  <div class="brand"><b>Face Cam</b><span id="sub">Loading face model…</span></div>
+  <select id="theme" aria-label="Theme">
+    <option value="system">System</option>
+    <option value="light">Light</option>
+    <option value="dark">Dark</option>
+  </select>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <canvas id="out" width="640" height="480"></canvas>
+    <video id="cam" playsinline muted></video>
+    <div class="start" id="startbox">
+      <button class="primary" id="start" disabled>Start camera</button>
+      <p>The camera and the face tracking stay on this device.</p>
+    </div>
+    <div class="over hide" id="status"></div>
+  </div>
+
+  <div class="shutter">
+    <div class="left">
+      <label class="ref btn" for="refpick">
+        <img id="refthumb" class="hide" alt="Reference face">
+        <span id="reflabel">Reference</span>
+        <input id="refpick" type="file" accept="image/*">
+      </label>
+    </div>
+    <button class="snap" id="snap" aria-label="Take photo" disabled></button>
+    <div class="right"><button id="flip" disabled>Flip</button></div>
+  </div>
+
+  <div class="panel">
+    <label>Blend <input id="strength" type="range" min="0" max="100" value="85"><span class="val" id="strengthval">85%</span></label>
+    <label><input id="tone" type="checkbox" checked> Match skin tone to the live face</label>
+    <label><input id="mesh" type="checkbox"> Show tracking mesh</label>
+    <div><button id="clearref" disabled>Remove reference photo</button></div>
+  </div>
+
+  <div id="notice" class="notice hide"></div>
+
+  <h2>Shots</h2>
+  <div class="shots" id="shots"></div>
+  <p class="empty" id="noshots">Shots stay in this tab until you save or share them.</p>
+
+  <p class="foot">Face tracking uses Google MediaPipe Face Landmarker on this device. The
+  reference photo is kept in this browser only. Use someone's face only with their permission.</p>
+</main>
+<script type="module" src="app.js"></script>
+</body></html>
