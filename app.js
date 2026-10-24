@@ -125,14 +125,27 @@ async function applyLook(e) {
   if (!text) return;
   els.apply.disabled = true;
   els.via.textContent = 'Reading…';
+  try {
+    await readLook(text);
+  } catch (err) {
+    // Show the real cause: a silent failure here looks like "nothing works".
+    console.error(err);
+    els.via.textContent = '';
+    els.said.textContent = `Could not apply that: ${err?.message || err}`;
+    els.said.classList.remove('hide');
+  } finally {
+    els.apply.disabled = false;
+  }
+}
+
+async function readLook(text) {
   const { patch, unknown, via, error } = await interpret(text, settings);
-  els.apply.disabled = false;
   els.via.textContent = via === 'claude' ? 'Read by Claude' : error
     ? 'Interpreter unreachable; read on this device' : 'Read on this device';
   setSettings(patch);
 
   const lines = describe(patch);
-  els.said.replaceChildren();
+  els.said.textContent = '';
   els.said.append(lines.length ? `Understood: ${lines.join(' · ')}` : 'Nothing in that matched a setting.');
   if (unknown.length) {
     const s = document.createElement('span');

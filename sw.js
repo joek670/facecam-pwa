@@ -8,7 +8,7 @@
  * phone should download once, not on every launch. Caching them is what
  * makes the app work with no signal after the first good load.
  */
-const SHELL = 'facecam-shell-2';
+const SHELL = 'facecam-shell-3';
 const MODEL = 'facecam-model-1';
 const ASSETS = [
   './', './index.html', './app.js', './face.js', './theme.js', './settings.js',
@@ -56,7 +56,11 @@ self.addEventListener('fetch', e => {
 
   if (new URL(url).origin !== self.location.origin) return;
   e.respondWith(
-    fetch(e.request)
+    // no-cache: revalidate with the server every time (a 304 is cheap).
+    // GitHub Pages sends max-age=600, and without this a plain fetch can be
+    // answered from the browser cache: a new index.html then runs with the
+    // old app.js, which finds none of its controls and stops at start-up.
+    fetch(e.request, { cache: 'no-cache' })
       .then(res => {
         const copy = res.clone();
         caches.open(SHELL).then(c => c.put(e.request, copy)).catch(() => {});
