@@ -1,14 +1,19 @@
-/* Face Cam — camera, reference photo, capture and the render loop.
- * face.js holds the tracking and the warp; this file is the app around it. */
-import { createLandmarker, buildMesh, meanColor, Renderer } from './face.js';
+/* Face Cam — camera, reference photo, settings, capture and the render loop.
+ * face.js holds the tracking and the rendering; settings.js the schema;
+ * interpret.js turns "Describe a look" into settings. */
+import { createLandmarker, buildMesh, meanColor, Renderer, REGIONS } from './face.js';
+import { DEFAULTS, REGION_LABELS, clean, describe, rgb } from './settings.js';
+import { interpret } from './interpret.js';
 
 const $ = id => document.getElementById(id);
 const els = {
   sub: $('sub'), stage: $('stage'), out: $('out'), cam: $('cam'), startbox: $('startbox'),
   start: $('start'), status: $('status'), snap: $('snap'), flip: $('flip'),
-  refpick: $('refpick'), refthumb: $('refthumb'), reflabel: $('reflabel'),
-  strength: $('strength'), strengthval: $('strengthval'), tone: $('tone'), mesh: $('mesh'),
-  clearref: $('clearref'), notice: $('notice'), shots: $('shots'), noshots: $('noshots'),
+  refpick: $('refpick'), refthumb: $('refthumb'), reflabel: $('reflabel'), clearref: $('clearref'),
+  notice: $('notice'), shots: $('shots'), noshots: $('noshots'),
+  lookform: $('lookform'), look: $('look'), apply: $('apply'), via: $('via'), said: $('said'),
+  regions: $('regions'), lighting: $('lighting'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
+  showMesh: $('showMesh'), reset: $('reset'),
 };
 
 const state = {
@@ -23,6 +28,123 @@ function notice(msg, isErr = false) {
   els.notice.textContent = msg || '';
   els.notice.classList.toggle('hide', !msg);
   els.notice.classList.toggle('err', isErr);
+}
+
+// ---------------------------------------------------------------------------
+// Settings. One object; every control and the text box write to it through
+// setSettings(), which validates, redraws the controls and saves.
+// ---------------------------------------------------------------------------
+
+const SETTINGS_KEY = 'facecam-settings';
+let settings = { ...DEFAULTS };
+try { settings = { ...DEFAULTS, ...clean(JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')) }; } catch (e) {}
+
+// [key, label, container, signed]. Signed sliders run -100..100 around 0.
+const SLIDERS = [
+  ['blend', 'Blend', 'refsliders', false],
+  ['eyeAmt', 'Eye colour amount', 'editsliders', false],
+  ['eyeSize', 'Eye size', 'editsliders', false],
+  ['smooth', 'Smooth skin', 'editsliders', false],
+  ['lipAmt', 'Lip colour amount', 'lipsliders', false],
+  ['warmth', 'Warmth', 'gradesliders', true],
+  ['brightness', 'Brightness', 'gradesliders', true],
+  ['contrast', 'Contrast', 'gradesliders', true],
+  ['saturation', 'Saturation', 'gradesliders', true],
+];
+const sliders = {};
+
+function buildControls() {
+  for (const [key, label, box, signed] of SLIDERS) {
+    const row = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = signed ? -100 : 0;
+    input.max = 100;
+    input.setAttribute('aria-label', label);
+    const val = document.createElement('span');
+    val.className = 'val';
+    row.append(label + ' ', input, val);
+    input.addEventListener('input', () => setSettings({ [key]: input.value / 100 }, { fromControl: key }));
+    $(box).append(row);
+    sliders[key] = { input, val, signed };
+  }
+  for (const r of REGIONS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = REGION_LABELS[r];
+    b.dataset.region = r;
+    b.addEventListener('click', () => {
+      const on = settings.regions.includes(r);
+      setSettings({ regions: on ? settings.regions.filter(x => x !== r) : [...settings.regions, r] });
+    });
+    els.regions.append(b);
+  }
+  els.lighting.addEventListener('change', () => setSettings({ lighting: els.lighting.value }));
+  els.eyeColor.addEventListener('input', () => setSettings({ eyeColor: els.eyeColor.value,
+    ...(settings.eyeAmt === 0 ? { eyeAmt: 0.6 } : {}) }));
+  els.lipColor.addEventListener('input', () => setSettings({ lipColor: els.lipColor.value,
+    ...(settings.lipAmt === 0 ? { lipAmt: 0.55 } : {}) }));
+  els.showMesh.addEventListener('change', () => setSettings({ showMesh: els.showMesh.checked }));
+  els.reset.addEventListener('click', () => {
+    const { regions, blend, lighting, ...edits } = DEFAULTS;
+    setSettings(edits);
+  });
+}
+
+function syncControls(skip) {
+  for (const [key, { input, val, signed }] of Object.entries(sliders)) {
+    const v = Math.round(settings[key] * 100);
+    if (key !== skip) input.value = v;
+    val.textContent = signed ? (v > 0 ? `+${v}` : `${v}`) : `${v}%`;
+  }
+  for (const b of els.regions.children) b.setAttribute('aria-pressed', settings.regions.includes(b.dataset.region));
+  els.lighting.value = settings.lighting;
+  els.eyeColor.value = settings.eyeColor;
+  els.lipColor.value = settings.lipColor;
+  els.showMesh.checked = settings.showMesh;
+}
+
+function setSettings(patch, { fromControl } = {}) {
+  settings = { ...settings, ...clean(patch) };
+  syncControls(fromControl);
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) {}
+}
+
+/** The settings in the form the renderer takes. */
+function renderSettings() {
+  return { ...settings, eyeColor: rgb(settings.eyeColor), lipColor: rgb(settings.lipColor) };
+}
+
+// ---------------------------------------------------------------------------
+// Describe a look
+// ---------------------------------------------------------------------------
+
+async function applyLook(e) {
+  e.preventDefault();
+  const text = els.look.value.trim();
+  if (!text) return;
+  els.apply.disabled = true;
+  els.via.textContent = 'Reading…';
+  const { patch, unknown, via, error } = await interpret(text, settings);
+  els.apply.disabled = false;
+  els.via.textContent = via === 'claude' ? 'Read by Claude' : error
+    ? 'Interpreter unreachable; read on this device' : 'Read on this device';
+  setSettings(patch);
+
+  const lines = describe(patch);
+  els.said.replaceChildren();
+  els.said.append(lines.length ? `Understood: ${lines.join(' · ')}` : 'Nothing in that matched a setting.');
+  if (unknown.length) {
+    const s = document.createElement('span');
+    s.textContent = `Not understood: ${unknown.join('; ')}`;
+    els.said.append(s);
+  }
+  if (patch.regions?.length && !state.refPoints) {
+    const s = document.createElement('span');
+    s.textContent = 'Add a reference photo for the features to come from.';
+    els.said.append(s);
+  }
+  els.said.classList.remove('hide');
 }
 
 // ---------------------------------------------------------------------------
@@ -177,27 +299,36 @@ function loop() {
       state.livePoints = r.faceLandmarks?.[0] || null;
     }
 
-    // Skin tone: scale the reference colours toward the live face's mean.
+    // Skin tone: move the reference colours toward the live face's mean.
+    // Photo colours: the whole colour, brightness included. Live lighting:
+    // the hue only, because the shader already matches brightness per pixel.
     // Sampled every 12 frames and eased, so a passing shadow does not flicker.
     const pts = state.livePoints;
     if (pts && state.refMean && state.frame % 12 === 0) {
       state.liveMean = meanColor(v, pts, v.videoWidth, v.videoHeight, scratch) || state.liveMean;
     }
-    const target = els.tone.checked && state.refMean && state.liveMean
-      ? state.liveMean.map((l, i) => clamp(l / Math.max(1, state.refMean[i]), 0.6, 1.6))
-      : [1, 1, 1];
+    let target = [1, 1, 1];
+    if (state.refMean && state.liveMean) {
+      const ratio = state.liveMean.map((l, i) => l / Math.max(1, state.refMean[i]));
+      if (settings.lighting === 'photo') target = ratio.map(r => clamp(r, 0.6, 1.6));
+      else {
+        const lum = c => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+        const k = lum(state.refMean) / Math.max(1, lum(state.liveMean));
+        target = ratio.map(r => clamp(r * k, 0.8, 1.25));
+      }
+    }
     state.gain = state.gain.map((g, i) => g + (target[i] - g) * 0.15);
 
     state.renderer.draw(v, {
       mirror: state.facing === 'user',
       points: pts,
-      strength: els.strength.value / 100,
       gain: state.gain,
-      showMesh: els.mesh.checked,
+      s: renderSettings(),
     });
     els.status.textContent = !pts ? 'Looking for a face…'
-      : !state.refPoints ? 'Face found. Add a reference photo to apply the filter.'
-      : 'Filter on.';
+      : !state.refPoints ? 'Face found.'
+      : !settings.regions.length ? 'Face found. No features chosen from the photo.'
+      : `From the photo: ${settings.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ')}.`;
     state.frame++;
   }
   if (state.stream) requestAnimationFrame(loop);
@@ -250,6 +381,9 @@ async function saveShot(file, url) {
 // ---------------------------------------------------------------------------
 
 function wire() {
+  buildControls();
+  syncControls();
+  els.lookform.addEventListener('submit', applyLook);
   els.start.addEventListener('click', startCamera);
   els.snap.addEventListener('click', capture);
   els.flip.addEventListener('click', () => {
@@ -262,9 +396,6 @@ function wire() {
     els.refpick.value = '';
   });
   els.clearref.addEventListener('click', clearReference);
-  const showStrength = () => (els.strengthval.textContent = `${els.strength.value}%`);
-  els.strength.addEventListener('input', showStrength);
-  showStrength();
   // Release the camera when the app is backgrounded; iOS shows the camera
   // indicator otherwise, and the stream is dead on return anyway.
   document.addEventListener('visibilitychange', () => {

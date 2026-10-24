@@ -1,0 +1,16 @@
+name = "facecam-interpreter"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# The API key is a secret, never a var: `npx wrangler secret put ANTHROPIC_API_KEY`.
+# No KV, no storage. The Worker holds no state and logs no text.
+
+# Per-IP request limit. Each request is one Claude call, so this bounds what
+# a single caller can spend. Adjust to taste.
+[[ratelimits]]
+name = "LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 20
+  period = 60

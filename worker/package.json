@@ -1,0 +1,16 @@
+{
+  "name": "facecam-interpreter",
+  "private": true,
+  "type": "module",
+  "description": "Reads Face Cam's \"Describe a look\" text with Claude and returns a settings patch.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.133.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}
