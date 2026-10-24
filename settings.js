@@ -9,16 +9,17 @@ import { REGIONS } from './face.js';
 
 export const DEFAULTS = Object.freeze({
   // 'look': recolour the live face with the photo's makeup and colour.
-  // 'features': draw the photo's own features over the live ones.
+  // 'features': a face swap. The live face takes the photo's proportions
+  // and its colours at full strength; the photo's pixels are never drawn.
   refMode: 'look',
   regions: ['face'],
   blend: 0.85,
-  lighting: 'live',
   eyeColor: '#3f7fd0',
   eyeAmt: 0,
   lipColor: '#b8323f',
   lipAmt: 0,
   smooth: 0,
+  toon: 0,
   eyeSize: 0,
   warmth: 0,
   brightness: 0,
@@ -29,14 +30,14 @@ export const DEFAULTS = Object.freeze({
 
 // Number settings: [min, max]. Amounts are 0..1, grades -1..1 with 0 = no change.
 export const RANGES = {
-  blend: [0, 1], eyeAmt: [0, 1], lipAmt: [0, 1], smooth: [0, 1], eyeSize: [0, 1],
+  blend: [0, 1], eyeAmt: [0, 1], lipAmt: [0, 1], smooth: [0, 1], eyeSize: [0, 1], toon: [0, 1],
   warmth: [-1, 1], brightness: [-1, 1], contrast: [-1, 1], saturation: [-1, 1],
 };
 
 export const LABELS = {
-  regions: 'From the photo', blend: 'Blend', lighting: 'Colour', eyeColor: 'Eye colour',
+  regions: 'From the photo', blend: 'Blend', eyeColor: 'Eye colour',
   eyeAmt: 'Eye colour', lipColor: 'Lip colour', lipAmt: 'Lip colour', smooth: 'Smooth skin',
-  eyeSize: 'Eye size', warmth: 'Warmth', brightness: 'Brightness', contrast: 'Contrast',
+  eyeSize: 'Eye size', toon: 'Cartoon style', warmth: 'Warmth', brightness: 'Brightness', contrast: 'Contrast',
   saturation: 'Saturation', showMesh: 'Tracking mesh',
 };
 
@@ -54,8 +55,6 @@ export function clean(patch) {
       out[k] = Math.min(hi, Math.max(lo, v));
     } else if ((k === 'eyeColor' || k === 'lipColor') && typeof v === 'string' && HEX.test(v)) {
       out[k] = v.toLowerCase();
-    } else if (k === 'lighting' && (v === 'live' || v === 'photo')) {
-      out[k] = v;
     } else if (k === 'refMode' && (v === 'look' || v === 'features')) {
       out[k] = v;
     } else if (k === 'showMesh' && typeof v === 'boolean') {
@@ -74,16 +73,15 @@ const signed = v => (v > 0 ? '+' : '') + Math.round(v * 100);
 export function describe(patch) {
   const lines = [];
   const p = patch;
-  if ('refMode' in p) lines.push(p.refMode === 'look' ? "The photo's look (colour and makeup)" : "The photo's features (face swap)");
+  if ('refMode' in p) lines.push(p.refMode === 'look' ? "The photo's look (colour and makeup)" : "Face swap: the photo's shape and colours");
   if ('regions' in p) lines.push(p.regions.length
     ? `From the photo: ${p.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ')}` : 'Nothing from the photo');
   if ('blend' in p) lines.push(`Blend ${pct(p.blend)}`);
-  if ('lighting' in p) lines.push(p.lighting === 'live' ? 'Live lighting' : 'Photo colours');
   if ('eyeAmt' in p || 'eyeColor' in p) lines.push(p.eyeAmt === 0 ? 'Eye colour off'
     : `Eye colour ${p.eyeColor || ''} ${'eyeAmt' in p ? pct(p.eyeAmt) : ''}`.replace(/\s+/g, ' ').trim());
   if ('lipAmt' in p || 'lipColor' in p) lines.push(p.lipAmt === 0 ? 'Lip colour off'
     : `Lip colour ${p.lipColor || ''} ${'lipAmt' in p ? pct(p.lipAmt) : ''}`.replace(/\s+/g, ' ').trim());
-  for (const k of ['smooth', 'eyeSize']) if (k in p) lines.push(`${LABELS[k]} ${pct(p[k])}`);
+  for (const k of ['smooth', 'eyeSize', 'toon']) if (k in p) lines.push(`${LABELS[k]} ${pct(p[k])}`);
   for (const k of ['warmth', 'brightness', 'contrast', 'saturation']) if (k in p) lines.push(`${LABELS[k]} ${signed(p[k])}`);
   if ('showMesh' in p) lines.push(p.showMesh ? 'Mesh on' : 'Mesh off');
   return lines;

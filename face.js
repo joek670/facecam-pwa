@@ -12,10 +12,14 @@
  *       Look (the default) recolours the live face with the photo's colours:
  *       makeup, lipstick, blush, skin tone, iris colour. The live face keeps
  *       its own features; nothing of the photo's face is drawn.
- *       Features draws the photo's own features over the live ones (a face
- *       swap), relit to match the live face.
+ *       Features (a face swap) also moves the live face's points to the
+ *       photo's proportions, then recolours it with the photo's colours at
+ *       full strength. The photo's pixels are never drawn: the face is
+ *       always the live one, so it blinks, talks and keeps its lighting.
  *   - edits with no reference: skin smoothing, lip colour, eye colour, and
  *     eye size (a warp of the mesh points around each eye).
+ *   - a cartoon style (flat colour, banded shading, ink lines) over the
+ *     whole frame, for a drawn or anime reference.
  *   - a colour grade (warmth, brightness, contrast, saturation), applied to
  *     the face and the background alike so there is no seam.
  *
@@ -129,7 +133,34 @@ export function buildMesh() {
   const alpha = new Float32Array(MESH_POINTS);
   for (let i = 0; i < MESH_POINTS; i++) alpha[i] = ring[i] < 0 ? 1 : FEATHER[ring[i]];
 
-  return { tris: new Uint16Array(tris), lines: new Uint16Array(lines), alpha };
+  // Face swap shape weights: how far each point moves toward the reference's
+  // proportions, per area, fading over two rings around the area. The face
+  // outline does not move: the background behind it is the unwarped camera
+  // frame, so a smaller chin would leave the real chin showing below it.
+  const grow = (seed, steps) => {
+    const w = new Float32Array(ALL_POINTS);
+    let f = [...seed];
+    f.forEach(i => (w[i] = 1));
+    for (const step of steps) {
+      const next = [];
+      for (const i of f) if (i < MESH_POINTS) for (const j of adj[i]) if (!w[j]) { w[j] = step; next.push(j); }
+      f = next;
+    }
+    return w;
+  };
+  const ends = edgeList => [...new Set(edgeList.flatMap(e => [e.start, e.end]))];
+  const IRIS = Array.from({ length: ALL_POINTS - MESH_POINTS }, (_, i) => MESH_POINTS + i);
+  const face = new Float32Array(ALL_POINTS).fill(1);
+  face.set(alpha);
+  const shape = {
+    face,
+    eyes: grow([...ends(FaceLandmarker.FACE_LANDMARKS_LEFT_EYE), ...ends(FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE), ...IRIS], [0.6, 0.25]),
+    brows: grow([...ends(FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW), ...ends(FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW)], [0.5, 0.2]),
+    nose: grow([...NOSE, 1, 2, 4, 5, 6, 19, 94, 195, 197], [0.6, 0.25]),
+    lips: grow(ends(FaceLandmarker.FACE_LANDMARKS_LIPS), [0.6, 0.25]),
+  };
+
+  return { tris: new Uint16Array(tris), lines: new Uint16Array(lines), alpha, shape };
 }
 
 /** Mean RGB of `source` sampled at the mesh points, on a small working canvas. */
@@ -281,14 +312,13 @@ function drawFeatureMask(canvas, w, h, P) {
  * not at all at 1.5 eye widths, so the rest of the face is untouched. The
  * push grows smoothly from zero, so the mesh never folds over itself.
  */
-function displace(points, amount, W, H, out) {
-  for (let i = 0; i < points.length; i++) { out[i * 2] = points[i].x; out[i * 2 + 1] = points[i].y; }
-  if (amount <= 0 || points.length < ALL_POINTS) return out;
+function displace(out, amount, W, H) {
+  if (amount <= 0) return out;
   const k = amount * 0.3;
   for (const [c, a, b] of [[468, 33, 133], [473, 362, 263]]) {
-    const cx = points[c].x * W, cy = points[c].y * H;
-    const R = 1.5 * Math.hypot((points[a].x - points[b].x) * W, (points[a].y - points[b].y) * H);
-    for (let i = 0; i < points.length; i++) {
+    const cx = out[c * 2] * W, cy = out[c * 2 + 1] * H;
+    const R = 1.5 * Math.hypot((out[a * 2] - out[b * 2]) * W, (out[a * 2 + 1] - out[b * 2 + 1]) * H);
+    for (let i = 0; i < ALL_POINTS; i++) {
       const dx = out[i * 2] * W - cx, dy = out[i * 2 + 1] * H - cy;
       const d = Math.hypot(dx, dy);
       if (d >= R) continue;
@@ -301,9 +331,38 @@ function displace(points, amount, W, H, out) {
   return out;
 }
 
+/**
+ * Points in the face's own frame: origin between the eyes, x along the line
+ * from one eye to the other, one unit the distance between them. The same
+ * face gives the same local points wherever it is in the image, at any
+ * size or roll, so a photo's proportions can be laid onto the live face.
+ * `pts` is flat [x0, y0, x1, y1, ...] in 0..1 image coordinates.
+ */
+function faceFrame(pts, W, H) {
+  const mid = (a, b) => [(pts[a * 2] + pts[b * 2]) / 2 * W, (pts[a * 2 + 1] + pts[b * 2 + 1]) / 2 * H];
+  const [lx, ly] = mid(33, 133);
+  const [rx, ry] = mid(362, 263);
+  const s = Math.max(1e-6, Math.hypot(rx - lx, ry - ly));
+  return { ox: (lx + rx) / 2, oy: (ly + ry) / 2, ux: (rx - lx) / s, uy: (ry - ly) / s, s };
+}
+
+function toLocal(pts, W, H, out) {
+  const { ox, oy, ux, uy, s } = faceFrame(pts, W, H);
+  for (let i = 0; i < ALL_POINTS; i++) {
+    const dx = pts[i * 2] * W - ox, dy = pts[i * 2 + 1] * H - oy;
+    out[i * 2] = (dx * ux + dy * uy) / s;
+    out[i * 2 + 1] = (dy * ux - dx * uy) / s;
+  }
+  return out;
+}
+
+function flatten(points, out) {
+  for (let i = 0; i < ALL_POINTS; i++) { out[i * 2] = points[i].x; out[i * 2 + 1] = points[i].y; }
+  return out;
+}
+
 /** Iris centre and radius in pixels, from the five iris points starting at `c`. */
 function iris(pts, c, W, H) {
-  if (pts.length < ALL_POINTS) return [0, 0, 0];
   const cx = pts[c * 2] * W, cy = pts[c * 2 + 1] * H;
   let r = 0;
   for (let i = 1; i <= 4; i++) r += Math.hypot(pts[(c + i) * 2] * W - cx, pts[(c + i) * 2 + 1] * H - cy);
@@ -342,6 +401,40 @@ function irisColor(image, points) {
   return n ? [r / n / 255, g / n / 255, b / n / 255] : [0.3, 0.2, 0.15];
 }
 
+/**
+ * The skin texture of the face in `image`: the median Laplacian of
+ * brightness, 0..255 scale, on both cheeks and the forehead, with the face
+ * scaled to 160 px wide. A photo's skin has grain and pores; anime and
+ * cartoon skin is flat fill or a smooth gradient, where the Laplacian is 0.
+ * Measured: photos 1.7 to 2.5, a photo smoothed at full strength 0.53, the
+ * cartoon style's own output 0.24 to 0.28, flat fill 0 to 0.24.
+ */
+export function skinTexture(image, points) {
+  const W = image.width, H = image.height;
+  const scale = 160 / Math.max(faceWidth(points, W, H), 1);
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(W * scale));
+  c.height = Math.max(1, Math.round(H * scale));
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0, c.width, c.height);
+  const px = ctx.getImageData(0, 0, c.width, c.height).data;
+  const L = (x, y) => { const k = (y * c.width + x) * 4; return 0.299 * px[k] + 0.587 * px[k + 1] + 0.114 * px[k + 2]; };
+  const laps = [];
+  // Both cheeks below the eyes, and the forehead above the brows.
+  for (const i of [205, 425, 151]) {
+    const cx = Math.round(points[i].x * c.width), cy = Math.round(points[i].y * c.height);
+    for (let y = cy - 16; y <= cy + 16; y++) {
+      for (let x = cx - 16; x <= cx + 16; x++) {
+        if (x < 1 || y < 1 || x >= c.width - 1 || y >= c.height - 1) continue;
+        laps.push(Math.abs(4 * L(x, y) - L(x - 1, y) - L(x + 1, y) - L(x, y - 1) - L(x, y + 1)) / 4);
+      }
+    }
+  }
+  if (!laps.length) return Infinity;
+  laps.sort((a, b) => a - b);
+  return laps[laps.length >> 1];
+}
+
 function faceWidth(points, W, H) {
   return Math.hypot((points[CHEEK_L].x - points[CHEEK_R].x) * W, (points[CHEEK_L].y - points[CHEEK_R].y) * H);
 }
@@ -369,6 +462,28 @@ vec3 applyGrade(vec3 c) {
   return clamp(c, 0.0, 1.0);
 }`;
 
+// Cartoon style, for the whole frame. toonA and toonB are the camera frame
+// blurred twice, B wider than A. A is the flat colour: pores and fine texture
+// gone. Where A is darker than B there is a dark edge, and that becomes an
+// ink line (a difference of Gaussians). Shading is cut into four soft bands.
+const TOON = `
+uniform float toonAmt;
+uniform sampler2D toonT;
+vec3 toonBase(vec3 c, vec2 p) {
+  return toonAmt > 0.0 ? mix(c, texture2D(toonT, p).rgb, toonAmt) : c;
+}
+vec3 applyToon(vec3 c, vec2 p) {
+  if (toonAmt <= 0.0) return c;
+  float l = max(dot(c, LUMA), 0.002);
+  float f = l * 4.0 + 0.35;
+  float q = (floor(f) + smoothstep(0.3, 0.7, fract(f))) / 4.0;
+  vec3 t = c * min(q / l, 3.0);
+  t = mix(vec3(dot(t, LUMA)), t, 1.3);
+  vec4 ab = texture2D(toonT, p);
+  t *= 1.0 - 0.82 * smoothstep(0.012, 0.035, ab.a - dot(ab.rgb, LUMA));
+  return mix(c, clamp(t, 0.0, 1.0), toonAmt);
+}`;
+
 // The camera image, full frame, for the background.
 const VS_BG = `
 attribute vec2 p;
@@ -379,10 +494,13 @@ void main() {
   if (mirror > 0.5) uv.x = 1.0 - uv.x;
   gl_Position = vec4(p, 0.0, 1.0);
 }`;
-const FS_BG = `${PRECISION}${GRADE}
+const FS_BG = `${PRECISION}${GRADE}${TOON}
 uniform sampler2D tex;
 varying vec2 uv;
-void main() { gl_FragColor = vec4(applyGrade(texture2D(tex, uv).rgb), 1.0); }`;
+void main() {
+  vec3 c = toonBase(texture2D(tex, uv).rgb, uv);
+  gl_FragColor = vec4(applyGrade(applyToon(c, uv)), 1.0);
+}`;
 
 // Offscreen passes keep image orientation: texture row t holds image row y = t,
 // the same as an uploaded image, so every texture is sampled with landmark
@@ -395,6 +513,12 @@ const FS_COPY = `${PRECISION}
 uniform sampler2D tex;
 varying vec2 uv;
 void main() { gl_FragColor = texture2D(tex, uv); }`;
+// The cartoon style's two blurs in one texture: A's colour, B's brightness.
+const FS_PACK = `${PRECISION}
+uniform sampler2D tex;
+uniform sampler2D texB;
+varying vec2 uv;
+void main() { gl_FragColor = vec4(texture2D(tex, uv).rgb, dot(texture2D(texB, uv).rgb, LUMA)); }`;
 // One direction of a 13-tap Gaussian; dir is the tap spacing in texture units.
 const FS_BLUR = `${PRECISION}
 uniform sampler2D tex;
@@ -432,11 +556,10 @@ void main() {
   uv = tc;
   va = a;
 }`;
-const FS_FACE = `${PRECISION}${GRADE}
+const FS_FACE = `${PRECISION}${GRADE}${TOON}
 uniform sampler2D video;
 uniform sampler2D liveLow;
 uniform sampler2D liveSmooth;
-uniform sampler2D ref;
 uniform sampler2D refLow;
 uniform sampler2D maskT;
 uniform sampler2D maskS;
@@ -444,15 +567,13 @@ uniform sampler2D maskX;
 uniform vec2 vsize;
 uniform float hasRef;
 uniform float blend;
-uniform float lighting;
-uniform float lookMode;
+uniform float swapMode;
 uniform float lumNorm;
 uniform float irisOn;
 uniform vec3 refIris;
 uniform float smoothAmt;
 uniform float lipAmt;
 uniform float eyeAmt;
-uniform vec3 gain;
 uniform vec3 lipColor;
 uniform vec3 eyeColor;
 uniform vec3 iris0;
@@ -478,7 +599,7 @@ float irisRing(vec3 ir, vec2 px) {
 }
 
 void main() {
-  vec3 c = texture2D(video, lp).rgb;
+  vec3 c = toonBase(texture2D(video, lp).rgb, lp);
 
   if (smoothAmt > 0.0) {
     vec3 sm = texture2D(liveSmooth, lp).rgb;
@@ -492,48 +613,38 @@ void main() {
   vec2 px = dp * vsize;
   float iris = max(irisRing(iris0, px), irisRing(iris1, px));
 
-  if (hasRef > 0.5 && lookMode > 0.5) {
-    // Look: take the photo's colour, not its pixels. Both images are blurred
-    // to a scale where makeup, lipstick, blush and skin tone survive but eyes,
+  if (hasRef > 0.5) {
+    // Take the photo's colour, never its pixels. Both images are blurred to a
+    // scale where makeup, lipstick, blush and skin tone survive but eyes,
     // pores and the shape of a nose do not, and the live face is recoloured
-    // by their ratio. The live face keeps its own features and detail.
+    // by their ratio. The live face keeps its own features, detail and
+    // expression; in a face swap the mesh has already been moved to the
+    // photo's proportions, so the photo's colours land on matching features.
     vec3 rl = texture2D(refLow, uv).rgb;
     vec3 ll = texture2D(liveLow, lp).rgb;
     float lr = max(dot(rl, LUMA), 0.03);
     float lv = max(dot(ll, LUMA), 0.03);
     vec3 chroma = (max(rl, vec3(0.01)) / lr) / (max(ll, vec3(0.01)) / lv);
-    // Darkness (eyeshadow, contour) transfers at half strength, measured
-    // against the faces' average brightness, so a darker photo does not
-    // darken the live face and the photo's own shadows mostly stay behind.
-    float shade = sqrt(clamp(lr / lv / lumNorm, 0.6, 1.5));
-    vec3 looked = clamp(c * clamp(chroma, 0.4, 2.5) * shade, 0.0, 1.0);
+    // Look: darkness (eyeshadow, contour) transfers at half strength,
+    // measured against the faces' average brightness, so a darker photo does
+    // not darken the live face. Face swap: the photo's light and dark come
+    // over in full, less half the difference in overall exposure, so the
+    // face is the photo's but does not glow or sink against the background.
+    float shade = swapMode > 0.5 ? clamp(lr / lv / sqrt(lumNorm), 0.4, 2.5)
+      : sqrt(clamp(lr / lv / lumNorm, 0.6, 1.5));
+    vec3 cr = swapMode > 0.5 ? clamp(chroma, 0.3, 3.0) : clamp(chroma, 0.4, 2.5);
+    vec3 looked = clamp(c * cr * shade, 0.0, 1.0);
     // The eye openings are left out: a gaze that differs from the photo's
     // would put its iris colour on the whites. The iris gets the photo's
     // iris colour on the live iris instead.
     c = mix(c, looked, blend * texture2D(maskT, dp).r * (1.0 - feat.g));
     if (irisOn > 0.5) c = tint(c, refIris, blend * feat.g * iris, 0.7);
-  } else if (hasRef > 0.5) {
-    vec3 r = texture2D(ref, uv).rgb;
-    vec3 rc;
-    if (lighting > 0.5) {
-      // Reference detail over live light: divide out the reference's own
-      // low-frequency brightness and multiply in the live face's. Brightness
-      // only: a per-channel ratio picks up strong local colour (eyeshadow,
-      // lipstick) from the blur and tints the feature with its opposite.
-      // Skin tone comes from gain instead, one face-wide correction.
-      float rl = dot(texture2D(refLow, uv).rgb, LUMA);
-      float ll = dot(texture2D(liveLow, lp).rgb, LUMA);
-      rc = r * clamp(ll / max(rl, 0.03), 0.3, 3.0) * gain;
-    } else {
-      rc = r * gain;
-    }
-    c = mix(c, clamp(rc, 0.0, 1.0), blend * texture2D(maskT, dp).r);
   }
 
   if (lipAmt > 0.0) c = tint(c, lipColor, lipAmt * feat.r, 0.35);
   if (eyeAmt > 0.0) c = tint(c, eyeColor, eyeAmt * feat.g * iris, 0.7);
 
-  gl_FragColor = vec4(applyGrade(c), va);
+  gl_FragColor = vec4(applyGrade(applyToon(c, lp)), va);
 }`;
 
 const VS_LINE = `
@@ -586,6 +697,7 @@ export class Renderer {
     this.bg = program(gl, VS_BG, FS_BG);
     this.copyProg = program(gl, VS_QUAD, FS_COPY);
     this.blurProg = program(gl, VS_QUAD, FS_BLUR);
+    this.packProg = program(gl, VS_QUAD, FS_PACK);
     this.face = program(gl, VS_FACE, FS_FACE);
     this.line = program(gl, VS_LINE, FS_LINE);
     this.videoTex = texture(gl);
@@ -614,6 +726,10 @@ export class Renderer {
 
     this.disp = new Float32Array(ALL_POINTS * 2);
     this.lpos = new Float32Array(MESH_POINTS * 2);
+    this.liveLocal = new Float32Array(ALL_POINTS * 2);
+    this.refLocal = null;
+    this.rest = null;
+    this.shapeKey = '';
     this.canvases = { transfer: document.createElement('canvas'), skin: document.createElement('canvas'),
       feature: document.createElement('canvas') };
     this.hasRef = false;
@@ -698,10 +814,9 @@ export class Renderer {
   }
 
   /**
-   * The reference photo and its 478 points. Also keeps two blurred copies:
-   * Features mode divides one out to get the reference detail; Look mode
-   * reads its colours from the other, blurred less so makeup survives. And
-   * the mean iris colour, for Look mode's eyes.
+   * The reference photo and its 478 points. Only a blurred copy is kept for
+   * drawing: the photo's colours, never its pixels. Also its points in the
+   * face's own frame, for the face swap's shape, and the mean iris colour.
    */
   setReference(image, points) {
     const gl = this.gl;
@@ -715,25 +830,62 @@ export class Renderer {
 
     const W = image.width, H = image.height;
     const fw = faceWidth(points, W, H);
-    const tmp = this.target('refTmp', W / 4, H / 4);
-    const low = this.target('refLow', W / 4, H / 4);
-    this.copy(this.refTex, low);
-    this.blur(low, tmp, fw / 16 / 4);
     const look = this.target('refLook', W / 4, H / 4);
     this.copy(this.refTex, look);
-    this.blur(look, tmp, fw * LOOK_BLUR / 4);
+    this.blur(look, this.target('refTmp', W / 4, H / 4), fw * LOOK_BLUR / 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.refIris = irisColor(image, points);
+    this.refLocal = points.length >= ALL_POINTS
+      ? toLocal(flatten(points, new Float32Array(ALL_POINTS * 2)), W, H, new Float32Array(ALL_POINTS * 2)) : null;
     this.hasRef = true;
   }
 
-  clearReference() { this.hasRef = false; }
+  clearReference() { this.hasRef = false; this.refLocal = null; }
+
+  /** Per-point shape weight for the chosen areas: the most any of them allows. */
+  shapeWeights(regions) {
+    const key = regions.join();
+    if (key !== this.shapeKey) {
+      this.shapeKey = key;
+      this.weights = new Float32Array(ALL_POINTS);
+      for (const r of regions) {
+        const w = this.mesh.shape[r];
+        for (let i = 0; i < ALL_POINTS; i++) this.weights[i] = Math.max(this.weights[i], w[i]);
+      }
+    }
+    return this.weights;
+  }
+
+  /**
+   * Face swap shape: move the live points toward the photo's proportions.
+   * Each point moves by the difference between where the photo has it and
+   * where this face has it at rest, both in the face's own frame. The rest
+   * shape is a slow average of the live face, so a blink or a smile is not
+   * part of it: the live expression still moves the face, on the photo's
+   * proportions (an anime face keeps its big eyes and still blinks).
+   */
+  morph(d, regions, amount, W, H) {
+    const L = toLocal(d, W, H, this.liveLocal);
+    if (!this.rest) this.rest = L.slice();
+    else for (let i = 0; i < L.length; i++) this.rest[i] += (L[i] - this.rest[i]) * 0.04;
+    const w = this.shapeWeights(regions);
+    const { ox, oy, ux, uy, s } = faceFrame(d, W, H);
+    const R = this.refLocal, rest = this.rest;
+    for (let i = 0; i < ALL_POINTS; i++) {
+      const k = amount * w[i];
+      if (k <= 0) continue;
+      const lx = L[i * 2] + k * (R[i * 2] - rest[i * 2]);
+      const ly = L[i * 2 + 1] + k * (R[i * 2 + 1] - rest[i * 2 + 1]);
+      d[i * 2] = (ox + s * (lx * ux - ly * uy)) / W;
+      d[i * 2 + 1] = (oy + s * (lx * uy + ly * ux)) / H;
+    }
+  }
 
   /**
    * One frame.
-   * f: { mirror, points (478 live points or null), gain, lumNorm, s (settings) }
-   * s: { regions[], blend, refMode ('look'|'features'), lighting ('live'|'photo'), smooth, eyeSize,
-   *      eyeColor [r,g,b], eyeAmt, lipColor [r,g,b], lipAmt,
+   * f: { mirror, points (478 live points or null), lumNorm, s (settings) }
+   * s: { regions[], blend, refMode ('look'|'features'), smooth, eyeSize,
+   *      eyeColor [r,g,b], eyeAmt, lipColor [r,g,b], lipAmt, toon,
    *      warmth, brightness, contrast, saturation, showMesh }
    */
   draw(video, f) {
@@ -745,25 +897,26 @@ export class Renderer {
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
-    const pts = f.points;
+    const pts = f.points?.length >= ALL_POINTS ? f.points : null;
     const transfer = this.hasRef && s.blend > 0 && s.regions.length > 0;
-    const look = transfer && s.refMode === 'look';
+    const swap = transfer && s.refMode === 'features' && this.refLocal;
     let irisA = [0, 0, 0], irisB = [0, 0, 0];
+    // With no face in view the cartoon style still needs a scale to work at.
+    let fw = W / 4;
+    if (!pts) this.rest = null;
     if (pts) {
-      const d = displace(pts, s.eyeSize, W, H, this.disp);
-      for (let i = 0; i < MESH_POINTS * 2; i++) this.lpos[i] = i % 2 ? pts[i >> 1].y : pts[i >> 1].x;
-      const fw = faceWidth(pts, W, H);
+      const d = flatten(pts, this.disp);
+      for (let i = 0; i < MESH_POINTS * 2; i++) this.lpos[i] = d[i];
+      if (swap) this.morph(d, s.regions, s.blend, W, H);
+      displace(d, s.eyeSize, W, H);
+      fw = faceWidth(pts, W, H);
       const Pq = i => [d[i * 2] * W / 4, d[i * 2 + 1] * H / 4];
       const Ph = i => [d[i * 2] * W / 2, d[i * 2 + 1] * H / 2];
 
-      if (look) {
+      if (transfer) {
         const low = this.target('liveLook', W / 4, H / 4);
         this.copy(this.videoTex, low);
         this.blur(low, this.target('tmpQ', W / 4, H / 4), fw * LOOK_BLUR / 4);
-      } else if (transfer && s.lighting === 'live') {
-        const low = this.target('liveLow', W / 4, H / 4);
-        this.copy(this.videoTex, low);
-        this.blur(low, this.target('tmpQ', W / 4, H / 4), fw / 16 / 4);
       }
       if (s.smooth > 0) {
         const sm = this.target('liveSmooth', W / 2, H / 2);
@@ -780,7 +933,7 @@ export class Renderer {
         this.upload(this.canvases.transfer, m);
         this.blur(m, this.target('tmpQ', W / 4, H / 4), 0.022 * fw / 4);
       }
-      if (s.lipAmt > 0 || s.eyeAmt > 0 || look) {
+      if (s.lipAmt > 0 || s.eyeAmt > 0 || transfer) {
         const c = this.canvases.feature;
         drawFeatureMask(c, Math.round(W / 2), Math.round(H / 2), Ph);
         gl.bindTexture(gl.TEXTURE_2D, this.featureTex);
@@ -789,6 +942,33 @@ export class Renderer {
       irisA = iris(d, 468, W, H);
       irisB = iris(d, 473, W, H);
     }
+
+    // Cartoon style: the flat-colour and the edge blurs, at half size, packed
+    // into one texture (B's brightness in A's alpha). The face pass already
+    // uses seven texture units, and WebGL promises only eight.
+    const T = this.targets;
+    if (s.toon > 0) {
+      const tmp = this.target('tmpH', W / 2, H / 2);
+      const a = this.target('toonA', W / 2, H / 2);
+      const b = this.target('toonB', W / 2, H / 2);
+      this.copy(this.videoTex, a);
+      this.blur(a, tmp, fw / 90 / 2);
+      this.copy(a.tex, b);
+      this.blur(b, tmp, fw / 90 / 2 * 1.25);
+      this.quadPass(this.packProg, a.tex, this.target('toon', W / 2, H / 2));
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, b.tex);
+      gl.uniform1i(this.u(this.packProg, 'texB'), 1);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.activeTexture(gl.TEXTURE0);
+    }
+    const toon = (prog, unit) => {
+      gl.uniform1f(this.u(prog, 'toonAmt'), s.toon);
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, s.toon > 0 ? T.toon.tex : null);
+      gl.uniform1i(this.u(prog, 'toonT'), unit);
+      gl.activeTexture(gl.TEXTURE0);
+    };
 
     // Background: the whole camera frame, graded.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -800,6 +980,7 @@ export class Renderer {
     gl.uniform1i(this.u(this.bg, 'tex'), 0);
     gl.uniform1f(this.u(this.bg, 'mirror'), f.mirror ? 1 : 0);
     gl.uniform4fv(this.u(this.bg, 'grade'), grade);
+    toon(this.bg, 1);
     this.attrib(this.bg, 'p', this.quad, 2);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     if (!pts) return;
@@ -814,32 +995,27 @@ export class Renderer {
     // The face: every edit in one pass.
     const p = this.face;
     this.useProgram(p);
-    const T = this.targets;
     const units = [
-      ['video', this.videoTex], ['liveLow', (look ? T.liveLook : T.liveLow)?.tex],
-      ['liveSmooth', T.liveSmooth?.tex], ['ref', this.refTex],
-      ['refLow', (look ? T.refLook : T.refLow)?.tex], ['maskT', T.maskT?.tex],
-      ['maskS', T.maskS?.tex], ['maskX', this.featureTex],
+      ['video', this.videoTex], ['liveLow', T.liveLook?.tex], ['liveSmooth', T.liveSmooth?.tex],
+      ['refLow', T.refLook?.tex], ['maskT', T.maskT?.tex], ['maskS', T.maskS?.tex], ['maskX', this.featureTex],
     ];
     units.forEach(([name, tex], i) => {
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(gl.TEXTURE_2D, tex || null);
       gl.uniform1i(this.u(p, name), i);
     });
-    gl.activeTexture(gl.TEXTURE0);
+    toon(p, units.length);
     gl.uniform1f(this.u(p, 'mirror'), f.mirror ? 1 : 0);
     gl.uniform2f(this.u(p, 'vsize'), W, H);
     gl.uniform1f(this.u(p, 'hasRef'), transfer ? 1 : 0);
     gl.uniform1f(this.u(p, 'blend'), s.blend);
-    gl.uniform1f(this.u(p, 'lighting'), s.lighting === 'live' ? 1 : 0);
-    gl.uniform1f(this.u(p, 'lookMode'), look ? 1 : 0);
+    gl.uniform1f(this.u(p, 'swapMode'), swap ? 1 : 0);
     gl.uniform1f(this.u(p, 'lumNorm'), f.lumNorm || 1);
-    gl.uniform1f(this.u(p, 'irisOn'), look && (s.regions.includes('eyes') || s.regions.includes('face')) ? 1 : 0);
+    gl.uniform1f(this.u(p, 'irisOn'), transfer && (s.regions.includes('eyes') || s.regions.includes('face')) ? 1 : 0);
     gl.uniform3fv(this.u(p, 'refIris'), this.refIris || [0.3, 0.2, 0.15]);
     gl.uniform1f(this.u(p, 'smoothAmt'), s.smooth);
     gl.uniform1f(this.u(p, 'lipAmt'), s.lipAmt);
     gl.uniform1f(this.u(p, 'eyeAmt'), s.eyeAmt);
-    gl.uniform3fv(this.u(p, 'gain'), f.gain);
     gl.uniform3fv(this.u(p, 'lipColor'), s.lipColor);
     gl.uniform3fv(this.u(p, 'eyeColor'), s.eyeColor);
     gl.uniform3fv(this.u(p, 'iris0'), irisA);

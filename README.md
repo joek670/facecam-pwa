@@ -20,18 +20,25 @@ text only.
   - **Look** (the default): the photo works as a filter. Your face takes its
     makeup, lipstick, blush, skin tone and iris colour, and keeps its own
     features, expression and lighting. Nothing of the photo's face is drawn.
-  - **Features**: a face swap. The photo's own eyes, nose and so on are drawn
-    over yours, relit to match the camera (**Live lighting**) or in the
-    photo's own colours (**Photo colours**).
+  - **Face swap**: your face takes the photo's proportions (eye size and
+    spacing, nose, mouth, brows) and its colours at full strength. The
+    photo's pixels are never drawn over you: the face on screen is always
+    your live face, reshaped and recoloured, so it blinks, talks and keeps
+    the camera's lighting.
+
+  Pick an anime or cartoon face and the app sees that its skin is flat
+  colour, not photographed skin, and turns on Face swap and Cartoon style.
 
   The photo is kept in this browser (IndexedDB) and is still set after a
   relaunch.
-- **Edits, no reference needed:** eye colour, lip colour, skin smoothing, and
-  eye size. A colour grade (warmth, brightness, contrast, saturation) applies
+- **Edits, no reference needed:** eye colour, lip colour, skin smoothing, eye
+  size, and a cartoon style for the whole picture. A colour grade (warmth, brightness, contrast, saturation) applies
   to the whole image.
 - **Describe a look:** type what you want; the app sets the controls and says
   what it understood and what it did not. The sliders stay the source of
   truth, so you can adjust after.
+- The camera stays in view while you scroll through the settings: at the top
+  on a phone, on the left on a wide screen.
 - Works offline after the first load. Light, dark, or system theme.
 
 ## How the filter works
@@ -54,11 +61,18 @@ face through it each frame in WebGL. One pass does all the face work:
   against each face's average, so a darker photo does not darken you. The
   eye openings are left out, and the irises take the photo's measured iris
   colour instead.
-- **Features, live lighting:** the reference is divided by a blurred copy of itself,
-  which leaves its detail, and multiplied by a blurred copy of the live face,
-  which supplies the live light. Brightness only; skin tone gets one face-wide
-  correction, so strong local colour (eyeshadow, lipstick) does not tint the
-  feature next to it.
+- **Face swap:** each live point moves by the difference between where the
+  photo has it and where your face has it at rest, both measured in the
+  face's own frame (origin between the eyes, one unit the eye spacing). The
+  rest shape is a slow average of the live face, so a blink or a smile still
+  moves the face. The face outline stays put, so the background never shows
+  a second jaw. The face is then recoloured as in Look, at full strength.
+- **Cartoon style:** the frame is blurred twice. The smaller blur is the flat
+  colour, shading is cut into four soft bands, and where the smaller blur is
+  darker than the larger one there is an edge, drawn as an ink line.
+- **Drawn-face check:** the median Laplacian of the skin on the cheeks and
+  forehead. Photos measured 1.7 to 2.5, a photo smoothed at full strength
+  0.53, cartoon output 0.24 to 0.28; below 0.4 counts as drawn.
 - **Eye colour:** a ring between the pupil and the iris edge, inside the eye
   opening, so the pupil and the whites keep their colour.
 - **Eye size:** the mesh points around each iris move outward, most at the

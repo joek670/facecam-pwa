@@ -56,7 +56,7 @@ export function parseLocal(text) {
   const all = text.toLowerCase().replace(/\bblack\s*(and|&|n)\s*white\b/g, 'b&w');
 
   if (/^\s*(reset|clear( all)?|no filters?|natural|start over|undo all)\s*\.?\s*$/.test(all)) {
-    const { regions, blend, lighting, ...edits } = DEFAULTS;
+    const { regions, blend, ...edits } = DEFAULTS;
     return { patch: { ...edits }, unknown };
   }
 
@@ -91,10 +91,10 @@ export function parseLocal(text) {
     const fromPhoto = photoPart && !color;
     let hit = fromPhoto && (PHOTO.test(t) || REGION_WORDS.some(([re]) => re.test(t)));
 
-    if (/\b(keep (my|the) (light|lighting)|live light(ing)?|natural light(ing)?|match (the )?light(ing)?)\b/.test(t)) {
-      patch.lighting = 'live'; hit = true;
+    // "Anime eyes" is the eye size below, not the whole style.
+    if (/\b(anime|manga|cartoon|toon|comic|cel[- ]?shad(ed|ing)|drawn|drawing)\b(?!\s+eyes?\b)/.test(t)) {
+      patch.toon = off ? 0 : amt ?? 0.8; hit = true;
     }
-    if (/\b(exact|photo|original) colou?rs?\b/.test(t)) { patch.lighting = 'photo'; hit = true; }
 
     if (!fromPhoto && /\b(eyes?|iris(es)?|eye colou?r)\b/.test(t) && (color || off) && !/\b(big|bigger|large|larger)\b/.test(t)) {
       if (off) patch.eyeAmt = 0;

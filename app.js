@@ -1,7 +1,7 @@
 /* Face Cam — camera, reference photo, settings, capture and the render loop.
  * face.js holds the tracking and the rendering; settings.js the schema;
  * interpret.js turns "Describe a look" into settings. */
-import { createLandmarker, buildMesh, meanColor, Renderer, REGIONS } from './face.js';
+import { createLandmarker, buildMesh, meanColor, skinTexture, Renderer, REGIONS } from './face.js';
 import { DEFAULTS, REGION_LABELS, clean, describe, rgb } from './settings.js';
 import { interpret } from './interpret.js';
 
@@ -12,7 +12,7 @@ const els = {
   refpick: $('refpick'), refthumb: $('refthumb'), reflabel: $('reflabel'), clearref: $('clearref'),
   notice: $('notice'), shots: $('shots'), noshots: $('noshots'),
   lookform: $('lookform'), look: $('look'), apply: $('apply'), via: $('via'), said: $('said'),
-  regions: $('regions'), lighting: $('lighting'), lightingrow: $('lightingrow'), refMode: $('refMode'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
+  regions: $('regions'), refMode: $('refMode'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
   showMesh: $('showMesh'), reset: $('reset'),
 };
 
@@ -20,7 +20,7 @@ const state = {
   videoLm: null, imageLm: null, renderer: null,
   stream: null, facing: 'user', running: false,
   livePoints: null, lastVideoTime: -1, frame: 0,
-  refPoints: null, refMean: null, liveMean: null, gain: [1, 1, 1],
+  refPoints: null, refMean: null, liveMean: null,
 };
 const scratch = document.createElement('canvas');
 
@@ -51,6 +51,7 @@ const SLIDERS = [
   ['eyeAmt', 'Eye colour amount', 'editsliders', false],
   ['eyeSize', 'Eye size', 'editsliders', false],
   ['smooth', 'Smooth skin', 'editsliders', false],
+  ['toon', 'Cartoon style', 'editsliders', false],
   ['lipAmt', 'Lip colour amount', 'lipsliders', false],
   ['warmth', 'Warmth', 'gradesliders', true],
   ['brightness', 'Brightness', 'gradesliders', true],
@@ -85,7 +86,6 @@ function buildControls() {
     });
     els.regions.append(b);
   }
-  els.lighting.addEventListener('change', () => setSettings({ lighting: els.lighting.value }));
   els.refMode.addEventListener('change', () => setSettings({ refMode: els.refMode.value }));
   els.eyeColor.addEventListener('input', () => setSettings({ eyeColor: els.eyeColor.value,
     ...(settings.eyeAmt === 0 ? { eyeAmt: 0.6 } : {}) }));
@@ -93,7 +93,7 @@ function buildControls() {
     ...(settings.lipAmt === 0 ? { lipAmt: 0.55 } : {}) }));
   els.showMesh.addEventListener('change', () => setSettings({ showMesh: els.showMesh.checked }));
   els.reset.addEventListener('click', () => {
-    const { regions, blend, lighting, ...edits } = DEFAULTS;
+    const { regions, blend, ...edits } = DEFAULTS;
     setSettings(edits);
   });
 }
@@ -105,10 +105,7 @@ function syncControls(skip) {
     val.textContent = signed ? (v > 0 ? `+${v}` : `${v}`) : `${v}%`;
   }
   for (const b of els.regions.children) b.setAttribute('aria-pressed', settings.regions.includes(b.dataset.region));
-  els.lighting.value = settings.lighting;
   els.refMode.value = settings.refMode;
-  // Live lighting vs photo colours only means something for a face swap.
-  els.lightingrow.classList.toggle('hide', settings.refMode !== 'features');
   els.eyeColor.value = settings.eyeColor;
   els.lipColor.value = settings.lipColor;
   els.showMesh.checked = settings.showMesh;
@@ -203,6 +200,9 @@ const store = {
 // ---------------------------------------------------------------------------
 
 const REF_MAX = 1024;
+// Skin texture below this is a drawn face (see skinTexture for what was
+// measured): between a fully smoothed photo and the cartoon style's output.
+const DRAWN = 0.4;
 
 /** Decode, honour EXIF rotation, and scale down to REF_MAX on the long side. */
 async function decodeImage(blob) {
@@ -239,6 +239,13 @@ async function setReference(blob, { save }) {
   els.reflabel.textContent = 'Change';
   els.clearref.disabled = false;
   notice('');
+  // A newly picked anime or cartoon face: a face swap in the cartoon style is
+  // what comes closest to it. Only on a new pick, so a relaunch does not undo
+  // what the person set since.
+  if (save && skinTexture(img, points) < DRAWN) {
+    setSettings({ refMode: 'features', toon: Math.max(settings.toon, 0.8) });
+    notice('This face looks drawn, so Face swap and Cartoon style are on. Change either below.');
+  }
   if (save) await store.set('ref', blob);
 }
 
@@ -322,31 +329,22 @@ function loop() {
       state.livePoints = r.faceLandmarks?.[0] || null;
     }
 
-    // Skin tone: move the reference colours toward the live face's mean.
-    // Photo colours: the whole colour, brightness included. Live lighting:
-    // the hue only, because the shader already matches brightness per pixel.
-    // Sampled every 12 frames and eased, so a passing shadow does not flicker.
+    // How much brighter the photo's face is overall than the live one, so the
+    // photo's exposure is not taken for makeup. Sampled every 12 frames, so a
+    // passing shadow does not flicker.
     const pts = state.livePoints;
     if (pts && state.refMean && state.frame % 12 === 0) {
       state.liveMean = meanColor(v, pts, v.videoWidth, v.videoHeight, scratch) || state.liveMean;
     }
-    let target = [1, 1, 1];
     let lumNorm = 1;
     if (state.refMean && state.liveMean) {
       const lum = c => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
-      // Look mode: how much brighter the photo's face is overall, so only
-      // local darkening (makeup, contour) transfers, not the photo's exposure.
       lumNorm = clamp(lum(state.refMean) / Math.max(1, lum(state.liveMean)), 0.3, 3);
-      const ratio = state.liveMean.map((l, i) => l / Math.max(1, state.refMean[i]));
-      if (settings.lighting === 'photo') target = ratio.map(r => clamp(r, 0.6, 1.6));
-      else target = ratio.map(r => clamp(r * lumNorm, 0.8, 1.25));
     }
-    state.gain = state.gain.map((g, i) => g + (target[i] - g) * 0.15);
 
     state.renderer.draw(v, {
       mirror: state.facing === 'user',
       points: pts,
-      gain: state.gain,
       lumNorm,
       s: renderSettings(),
     });
@@ -355,7 +353,7 @@ function loop() {
       : !state.refPoints ? 'Face found.'
       : !settings.regions.length ? 'Face found. No areas chosen from the photo.'
       : settings.refMode === 'look' ? `The photo's look on: ${areas}.`
-      : `The photo's features: ${areas}.`;
+      : `Face swap: ${areas}.`;
     state.frame++;
   }
   if (state.stream) requestAnimationFrame(loop);

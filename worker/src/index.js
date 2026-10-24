@@ -40,18 +40,17 @@ const SCHEMA = {
       additionalProperties: false,
       properties: {
         refMode: { type: 'string', enum: ['look', 'features'],
-          description: "'look' recolours the live face with the photo's makeup and colours, keeping the person's own features; 'features' draws the photo's own features over theirs (a face swap)." },
+          description: "'look' recolours the live face with the photo's makeup and colours, keeping the person's own features; 'features' is a face swap: their face takes the photo's proportions and colours, still moving with them." },
         regions: { type: 'array', items: { type: 'string', enum: REGIONS },
           description: 'Areas the photo applies to. Replaces the current list. [] takes nothing.' },
         blend: { type: 'number', minimum: 0, maximum: 1, description: 'How strongly the photo features show. 0..1.' },
-        lighting: { type: 'string', enum: ['live', 'photo'],
-          description: "'live' keeps the camera's light and skin tone; 'photo' keeps the photo's exact colours." },
         eyeColor: { type: 'string', pattern: '^#[0-9a-f]{6}$', description: 'Iris colour, lowercase #rrggbb.' },
         eyeAmt: { type: 'number', minimum: 0, maximum: 1, description: 'Iris colour strength. 0 turns it off.' },
         lipColor: { type: 'string', pattern: '^#[0-9a-f]{6}$', description: 'Lip colour, lowercase #rrggbb.' },
         lipAmt: { type: 'number', minimum: 0, maximum: 1, description: 'Lip colour strength. 0 turns it off.' },
         smooth: { type: 'number', minimum: 0, maximum: 1, description: 'Skin smoothing. 0 is off.' },
         eyeSize: { type: 'number', minimum: 0, maximum: 1, description: 'Eye enlargement. 0 is natural size; it cannot shrink.' },
+        toon: { type: 'number', minimum: 0, maximum: 1, description: 'Cartoon or anime style over the whole picture: flat colour, banded shading, ink lines. 0 is off.' },
         warmth: { type: 'number', minimum: -1, maximum: 1, description: 'Negative cooler (blue), positive warmer (orange). 0 is none.' },
         brightness: { type: 'number', minimum: -1, maximum: 1, description: '0 is unchanged.' },
         contrast: { type: 'number', minimum: -1, maximum: 1, description: '0 is unchanged.' },
@@ -66,7 +65,7 @@ const SCHEMA = {
 
 const SYSTEM = `You set the controls of Face Cam, a phone camera filter, from a short description someone typed.
 
-The filter can do only what the settings schema lists: apply a reference photo the person chose to some areas (whole face, eyes, brows, nose, lips), either as its look (makeup, lipstick, skin tone and iris colour, keeping the person's own face; the default) or as its features (a face swap); recolour irises and lips; smooth skin; enlarge eyes; and grade the whole image (warmth, brightness, contrast, saturation). It cannot add objects, accessories, hair, makeup other than lip colour, backgrounds, or artistic styles.
+The filter can do only what the settings schema lists: apply a reference photo the person chose to some areas (whole face, eyes, brows, nose, lips), either as its look (makeup, lipstick, skin tone and iris colour, keeping the person's own face; the default) or as its features (a face swap); recolour irises and lips; smooth skin; enlarge eyes; draw the whole picture in a cartoon or anime style; and grade the whole image (warmth, brightness, contrast, saturation). It cannot add objects, accessories, hair, makeup other than lip colour, backgrounds, or artistic styles other than the cartoon style.
 
 Return a patch with only the settings the text asks to change, and leave everything else out. The current settings are given so that relative requests work: "a bit warmer" adds about 0.2 to the current warmth; "more" or "less" moves about 0.25. Amounts: "slight", "a little" or "subtle" is about 0.3; no qualifier is about 0.55; "very" or "strong" is about 0.85; a percentage is used as given. Colours are realistic for the feature: "blue eyes" is a natural blue, not pure #0000ff; "red lips" is a lipstick red.
 
