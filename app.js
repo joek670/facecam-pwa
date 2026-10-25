@@ -288,7 +288,7 @@ async function sampleRefHair() {
     t = await referenceHair(img);
   } catch (err) {
     console.error(err);
-    notice('The hair and background model could not load. Check the connection and reload.', true);
+    notice(`The hair and background model could not load. Check the connection and reload. (${err?.message || err})`, true);
     return;
   }
   if (state.refImg !== img) return;
@@ -378,7 +378,8 @@ function loadSegmenter() {
     .catch(err => {
       console.error(err);
       state.segFailed = true;
-      notice('The hair and background model could not load. Check the connection and reload.', true);
+      // A phone has no console to read, so the notice carries the error.
+      notice(`The hair and background model could not load. Check the connection and reload. (${err?.message || err})`, true);
     });
 }
 
@@ -401,7 +402,7 @@ function segment(v) {
   } catch (err) {
     console.error(err);
     state.segFailed = true;
-    notice('Hair and background effects failed on this device and are off.', true);
+    notice(`Hair and background effects failed on this device and are off. (${err?.message || err})`, true);
     return;
   }
   const ms = performance.now() - t0;
