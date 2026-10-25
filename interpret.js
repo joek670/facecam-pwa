@@ -78,15 +78,18 @@ export function parseLocal(text) {
     const photo = PHOTO.test(part);
     const own = part.split(SUB).filter(s => !HAIR_BG.test(s)).join(' ');
     if (photo && PHOTO.test(own)) {
-      if (/\b(swap|features?|transfer|their (face|eyes|nose|lips))\b/.test(own)) patch.refMode = 'features';
-      else if (/\b(look|makeup|make-up|style|vibe|tone)\b/.test(own)) patch.refMode = 'look';
-      const regions = REGION_WORDS.filter(([re]) => re.test(own)).map(([, r]) => r);
-      if (regions.length) {
-        patch.regions = /\b(no|without|remove)\b/.test(own) ? [] : regions;
-        const amt = intensity(takeColor(own)[1]);
-        if (amt !== null) patch.blend = amt;
-      } else if (/\b(nothing|none|no|stop|remove|without)\b/.test(own)) {
-        patch.regions = [];
+      // "No face swap" turns the photo off and leaves the mode as it was.
+      const off = /\b(nothing|none|no|stop|remove|without|turn off)\b/.test(own);
+      if (off) patch.regions = [];
+      else {
+        if (/\b(swap|features?|transfer|their (face|eyes|nose|lips))\b/.test(own)) patch.refMode = 'features';
+        else if (/\b(look|makeup|make-up|style|vibe|tone)\b/.test(own)) patch.refMode = 'look';
+        const regions = REGION_WORDS.filter(([re]) => re.test(own)).map(([, r]) => r);
+        if (regions.length) {
+          patch.regions = regions;
+          const amt = intensity(takeColor(own)[1]);
+          if (amt !== null) patch.blend = amt;
+        }
       }
     }
     for (const raw of part.split(SUB)) clauses.push([raw, photo]);
