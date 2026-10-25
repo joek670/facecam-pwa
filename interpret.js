@@ -61,8 +61,10 @@ function takeColor(t) {
 export function parseLocal(text) {
   const patch = {};
   const unknown = [];
-  // Join phrases that contain a clause word before splitting on it.
-  const all = text.toLowerCase().replace(/\bblack\s*(and|&|n)\s*white\b/g, 'b&w');
+  // Join phrases that contain a clause word before splitting on it. A gender
+  // swap becomes one word, so its "swap" is not read as the photo's.
+  const all = text.toLowerCase().replace(/\bblack\s*(and|&|n)\s*white\b/g, 'b&w')
+    .replace(/\b(gender[- ]?(swap|bend|flip)(ped|per|ping)?|swap(ped)? (my )?gender|opposite (sex|gender))\b/g, 'genderswap');
 
   if (/^\s*(reset|clear( all)?|no filters?|natural|start over|undo all)\s*\.?\s*$/.test(all)) {
     const { regions, blend, ...edits } = DEFAULTS;
@@ -106,8 +108,27 @@ export function parseLocal(text) {
     const fromPhoto = photoPart && !color;
     let hit = fromPhoto && (PHOTO.test(t) || REGION_WORDS.some(([re]) => re.test(t)));
 
+    // The filters. "Anime filter", "anime face" or "make me anime" is the
+    // anime filter; a gender named with a cue ("make me a woman", "more
+    // masculine", "male version") or a gender swap is the gender swap, and
+    // a bare gender swap is the feminine one.
+    const animeFilter = /\b(anime|manga) (filter|face|character|version|me)\b/.test(t)
+      || /\b(make me|turn me into|as) (an? )?(anime|manga)\b/.test(t);
+    const fem = /\b(feminine|female|woman|women|girl|girly|lady|femme)\b/.test(t);
+    const masc = /\b(masculine|male|man|men|boy|guy|manly|dude)\b/.test(t);
+    const swapG = /\bgenderswap\b/.test(t);
+    const cue = swapG || /\b(feminine|masculine|version|more|make me|turn me into|as an?|look like an?)\b/.test(t);
+    let filter = null;
+    if (animeFilter) filter = off ? 'none' : 'anime';
+    else if (!fromPhoto && cue && (swapG || fem !== masc)) filter = off ? 'none' : masc && !fem ? 'masculine' : 'feminine';
+    else if (off && /\bfilters?\b/.test(t)) filter = 'none';
+    if (filter) {
+      patch.filter = filter; hit = true;
+      if (filter !== 'none' && amt !== null) patch.filterAmt = amt;
+    }
+
     // "Anime eyes" is the eye size below, not the whole style.
-    if (/\b(anime|manga|cartoon|toon|comic|cel[- ]?shad(ed|ing)|drawn|drawing)\b(?!\s+eyes?\b)/.test(t)) {
+    if (!animeFilter && /\b(anime|manga|cartoon|toon|comic|cel[- ]?shad(ed|ing)|drawn|drawing)\b(?!\s+eyes?\b)/.test(t)) {
       patch.toon = off ? 0 : amt ?? 0.8; hit = true;
     }
 

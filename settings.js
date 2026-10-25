@@ -5,7 +5,7 @@
  * schema is dropped, so a bad interpreter answer can change nothing it
  * should not.
  */
-import { REGIONS } from './face.js';
+import { REGIONS, FILTERS } from './face.js';
 
 export const DEFAULTS = Object.freeze({
   // 'look': recolour the live face with the photo's makeup and colour.
@@ -33,14 +33,22 @@ export const DEFAULTS = Object.freeze({
   brightness: 0,
   contrast: 0,
   saturation: 0,
+  // A filter that needs no photo: 'none', 'anime', or a gender swap,
+  // 'feminine' or 'masculine'. It adds to the edits and the photo.
+  filter: 'none',
+  filterAmt: 1,
   showMesh: false,
 });
 
 // Number settings: [min, max]. Amounts are 0..1, grades -1..1 with 0 = no change.
 export const RANGES = {
   blend: [0, 1], eyeAmt: [0, 1], lipAmt: [0, 1], smooth: [0, 1], eyeSize: [0, 1], toon: [0, 1],
-  hairAmt: [0, 1], bgBlur: [0, 1], bgAmt: [0, 1],
+  hairAmt: [0, 1], bgBlur: [0, 1], bgAmt: [0, 1], filterAmt: [0, 1],
   warmth: [-1, 1], brightness: [-1, 1], contrast: [-1, 1], saturation: [-1, 1],
+};
+
+export const FILTER_LABELS = {
+  none: 'No filter', anime: 'Anime', feminine: 'Gender swap: feminine', masculine: 'Gender swap: masculine',
 };
 
 export const LABELS = {
@@ -49,7 +57,7 @@ export const LABELS = {
   eyeSize: 'Eye size', toon: 'Cartoon style', hairColor: 'Hair colour', hairAmt: 'Hair colour',
   bgBlur: 'Background blur', bgColor: 'Background colour', bgAmt: 'Background colour',
   warmth: 'Warmth', brightness: 'Brightness', contrast: 'Contrast',
-  saturation: 'Saturation', showMesh: 'Tracking mesh',
+  saturation: 'Saturation', filter: 'Filter', filterAmt: 'Filter strength', showMesh: 'Tracking mesh',
 };
 
 const COLOR_KEYS = ['eyeColor', 'lipColor', 'hairColor', 'bgColor'];
@@ -69,6 +77,8 @@ export function clean(patch) {
     } else if (COLOR_KEYS.includes(k) && typeof v === 'string' && HEX.test(v)) {
       out[k] = v.toLowerCase();
     } else if (k === 'refMode' && (v === 'look' || v === 'features')) {
+      out[k] = v;
+    } else if (k === 'filter' && FILTERS.includes(v)) {
       out[k] = v;
     } else if ((k === 'showMesh' || k === 'refHair') && typeof v === 'boolean') {
       out[k] = v;
@@ -102,6 +112,8 @@ export function describe(patch) {
   for (const k of ['smooth', 'eyeSize', 'toon', 'bgBlur']) if (k in p) lines.push(`${LABELS[k]} ${pct(p[k])}`);
   colour('bgAmt', 'bgColor', 'Background colour');
   for (const k of ['warmth', 'brightness', 'contrast', 'saturation']) if (k in p) lines.push(`${LABELS[k]} ${signed(p[k])}`);
+  if ('filter' in p) lines.push(p.filter === 'none' ? 'No filter' : `Filter: ${FILTER_LABELS[p.filter]}`);
+  if ('filterAmt' in p) lines.push(`${LABELS.filterAmt} ${pct(p.filterAmt)}`);
   if ('showMesh' in p) lines.push(p.showMesh ? 'Mesh on' : 'Mesh off');
   return lines;
 }

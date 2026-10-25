@@ -3,7 +3,7 @@
  * interpret.js turns "Describe a look" into settings. */
 import { createLandmarker, createSegmenter, segmentFrame, referenceHair, buildMesh, meanColor, skinTexture,
   Renderer, REGIONS } from './face.js';
-import { DEFAULTS, REGION_LABELS, clean, describe, rgb } from './settings.js';
+import { DEFAULTS, REGION_LABELS, FILTER_LABELS, clean, describe, rgb } from './settings.js';
 import { interpret } from './interpret.js';
 
 const $ = id => document.getElementById(id);
@@ -15,7 +15,7 @@ const els = {
   lookform: $('lookform'), look: $('look'), apply: $('apply'), via: $('via'), said: $('said'),
   regions: $('regions'), refMode: $('refMode'), refHair: $('refHair'), eyeColor: $('eyeColor'),
   lipColor: $('lipColor'), hairColor: $('hairColor'), bgColor: $('bgColor'),
-  showMesh: $('showMesh'), reset: $('reset'),
+  showMesh: $('showMesh'), reset: $('reset'), filter: $('filter'), filtersliders: $('filtersliders'),
 };
 
 const state = {
@@ -53,6 +53,7 @@ try {
 
 // [key, label, container, signed]. Signed sliders run -100..100 around 0.
 const SLIDERS = [
+  ['filterAmt', 'Strength', 'filtersliders', false],
   ['blend', 'Blend', 'refsliders', false],
   ['eyeAmt', 'Eye colour amount', 'editsliders', false],
   ['eyeSize', 'Eye size', 'editsliders', false],
@@ -96,6 +97,7 @@ function buildControls() {
     els.regions.append(b);
   }
   els.refMode.addEventListener('change', () => setSettings({ refMode: els.refMode.value }));
+  els.filter.addEventListener('change', () => setSettings({ filter: els.filter.value }));
   els.eyeColor.addEventListener('input', () => setSettings({ eyeColor: els.eyeColor.value,
     ...(settings.eyeAmt === 0 ? { eyeAmt: 0.6 } : {}) }));
   els.lipColor.addEventListener('input', () => setSettings({ lipColor: els.lipColor.value,
@@ -120,6 +122,9 @@ function syncControls(skip) {
   }
   for (const b of els.regions.children) b.setAttribute('aria-pressed', settings.regions.includes(b.dataset.region));
   els.refMode.value = settings.refMode;
+  els.filter.value = settings.filter;
+  // The strength shows only while a filter is on.
+  els.filtersliders.classList.toggle('hide', settings.filter === 'none');
   els.refHair.checked = settings.refHair;
   // The photo's hair colour applies only in a face swap.
   els.refHair.disabled = settings.refMode !== 'features';
@@ -444,12 +449,13 @@ function loop() {
       s: renderSettings(),
     });
     const areas = settings.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ');
+    const filter = settings.filter !== 'none' ? ` Filter: ${FILTER_LABELS[settings.filter]}.` : '';
     els.status.textContent = segNeeded() && !state.segLm && !state.segFailed ? 'Loading the hair and background model…'
       : !pts ? 'Looking for a face…'
-      : !state.refPoints ? 'Face found.'
+      : (!state.refPoints ? 'Face found.'
       : !settings.regions.length ? 'Face found. No areas chosen from the photo.'
       : settings.refMode === 'look' ? `The photo's look on: ${areas}.`
-      : `Face swap: ${areas}.`;
+      : `Face swap: ${areas}.`) + filter;
     state.frame++;
   }
   if (state.stream) requestAnimationFrame(loop);

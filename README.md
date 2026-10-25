@@ -41,6 +41,21 @@ text only.
   colour that replaces the background. The cartoon style and the colour
   grade apply over these too. They use a second model, downloaded (16 MB)
   the first time one of them is turned on.
+- **Face filters:** a drop-down under the shutter, with a strength slider:
+  - **Anime:** bigger eyes, a small nose and mouth, a narrower jaw and
+    shorter chin, pink lips, blush, a catchlight in each eye, and the cartoon
+    style.
+  - **Gender swap: feminine:** a narrower jaw and shorter lower face, fuller
+    cheekbones, a slightly smaller face, larger eyes, a smaller nose, fuller
+    lips, higher brows; rose lips, blush, eyeshadow, a darker lash line with a
+    small wing, smoother skin with a soft glow.
+  - **Gender swap: masculine:** a wider jaw and longer lower face, a slightly
+    larger face, lower and heavier brows, a shadow under the brow ridge,
+    smaller eyes, a larger nose, thinner lips; stubble over the jaw, chin and
+    upper lip; less skin smoothing.
+
+  Like Face swap, a filter only reshapes and recolours your live face. Long
+  hair and other things a generative model would paint in are not possible.
 - **Describe a look:** type what you want; the app sets the controls and says
   what it understood and what it did not. The sliders stay the source of
   truth, so you can adjust after.
@@ -86,6 +101,22 @@ face through it each frame in WebGL. One pass does all the face work:
   centre and not at all 1.5 eye widths away.
 - **Skin smoothing:** edge-aware; it softens skin but leaves edges such as the
   jaw and nostrils sharp, and it skips the eyes, brows, and mouth.
+- **Face filters:** each point moves by a smooth field of where it is on the
+  live face, in the face's own frame: bumps that grow or shrink the eyes,
+  nose and mouth about their centres, a pull of the lower face toward (or
+  away from) the midline, a ramp that shortens or lengthens the face below
+  the nose, a push on the cheekbones, and a scale of the whole face. Each
+  part is gentle enough that the mesh never folds. The amounts follow facial
+  dimorphism studies (men: wider jaws, longer lower faces, lower brows,
+  faces some 6% larger; women: larger eyes, fuller lips, smaller noses),
+  about doubled so the change reads at a glance. Unlike Face swap, a filter
+  moves the face outline. The outline's move is capped at 0.1 face widths,
+  and the background is drawn as a 41 x 41 grid whose points follow the
+  outline's move with a Gaussian falloff, so the background bends with the
+  jaw and no second jaw shows. (Moving the outline in Face swap was measured
+  too and gave no gain, so Face swap keeps it still.) The colour (blush,
+  lips, lash line, stubble with a grain fixed to the skin) is placed in the
+  same face frame, so it stays on the face at any size or roll.
 
 Hair and background come from a second model,
 [MediaPipe Image Segmenter](https://ai.google.dev/edge/mediapipe/solutions/vision/image_segmenter)
@@ -126,7 +157,8 @@ used).
 With no interpreter configured, `interpret.js` reads the text on the device
 with a fixed word list: colours, "from my photo", "slightly", "very",
 percentages, "black and white", "no lipstick", "blonde hair", "blur the
-background", "white background", and similar.
+background", "white background", "anime filter", "gender swap", "make me a
+guy", and similar.
 
 With the Worker in `worker/` deployed (see [DEPLOY.md](DEPLOY.md), step 3),
 Claude reads the text and fills in the settings schema, which handles loose

@@ -20,8 +20,15 @@
  *     eye size (a warp of the mesh points around each eye).
  *   - a cartoon style (flat colour, banded shading, ink lines) over the
  *     whole frame, for a drawn or anime reference.
+ *   - filters that need no photo (anime; a gender swap either way): a
+ *     smooth reshaping of the mesh in the face's own frame, and colour
+ *     worked out on the live face (blush, lip colour, stubble).
  *   - a colour grade (warmth, brightness, contrast, saturation), applied to
  *     the face and the background alike so there is no seam.
+ *
+ * When a filter moves the face outline, the background is drawn through a
+ * grid around the face that moves with it, so the real jaw never shows
+ * beside the new one.
  *
  * A second model, MediaPipe Image Segmenter, sorts every pixel of the frame
  * into hair, background, skin, clothes and others. The background pass uses
@@ -67,6 +74,19 @@ const NOSE = [168, 193, 245, 188, 174, 236, 198, 209, 129, 64, 98, 97, 2,
 const CHEEK_L = 234, CHEEK_R = 454;
 
 export const REGIONS = ['face', 'eyes', 'brows', 'nose', 'lips'];
+
+// Filters with no reference photo. Each reshapes and recolours the live face;
+// none draws anything that is not the camera image.
+export const FILTERS = ['none', 'anime', 'feminine', 'masculine'];
+
+// The most the face outline may move, in face widths, and the reach of the
+// background's movement around it (a Gaussian's sigma). The background grid
+// stretches by at most about EDGE_MAX / BG_SIGMA * 0.6, well under 1, so it
+// never folds.
+const EDGE_MAX = 0.1;
+const BG_SIGMA = 0.13;
+// Grid cells on each side of the background grid around the face.
+const GRID = 40;
 
 let vision = null;
 let FaceLandmarker = null;
@@ -258,8 +278,9 @@ export function buildMesh() {
 
   // Face swap shape weights: how far each point moves toward the reference's
   // proportions, per area, fading over two rings around the area. The face
-  // outline does not move: the background behind it is the unwarped camera
-  // frame, so a smaller chin would leave the real chin showing below it.
+  // outline does not move. With the background following it (see
+  // Renderer.warpBackground) it could, but measured against a known target
+  // that was no closer on the outline and a little further off elsewhere.
   const grow = (seed, steps) => {
     const w = new Float32Array(ALL_POINTS);
     let f = [...seed];
@@ -283,7 +304,16 @@ export function buildMesh() {
     lips: grow(ends(FaceLandmarker.FACE_LANDMARKS_LIPS), [0.6, 0.25]),
   };
 
-  return { tris: new Uint16Array(tris), lines: new Uint16Array(lines), alpha, shape };
+  // The outline, which the background follows, and the outline with the
+  // three rings in from it, whose movement is capped (Renderer.capEdge).
+  const oval = [], edge = [];
+  for (let i = 0; i < MESH_POINTS; i++) {
+    if (ring[i] === 0) oval.push(i);
+    if (ring[i] >= 0) edge.push(i);
+  }
+
+  return { tris: new Uint16Array(tris), lines: new Uint16Array(lines), alpha, shape,
+    oval: new Uint16Array(oval), edge: new Uint16Array(edge) };
 }
 
 /** Mean RGB of `source` sampled at the mesh points, on a small working canvas. */
@@ -423,12 +453,50 @@ function drawSkinMask(canvas, w, h, P, fw) {
   paint(ctx, 'lips', P, '#000', 0.04 * fw);
 }
 
-/** Hard-edged: red on the lips, green in the eye openings. Recolouring uses it. */
-function drawFeatureMask(canvas, w, h, P) {
+/**
+ * Hard-edged: red on the lips, green in the eye openings. Recolouring uses it.
+ * With browFw (the face width at this size), the brows too, in blue, grown and
+ * with a soft edge from three strokes laid over each other. With lashFw
+ * instead, a lash line in blue along each upper lid, with a small wing past
+ * the outer corner.
+ */
+function drawFeatureMask(canvas, w, h, P, browFw = 0, lashFw = 0) {
   const ctx = prepare(canvas, w, h);
   paint(ctx, 'lips', P, '#f00', 0, 'evenodd');
   paint(ctx, 'eyes', P, '#0f0', 0);
+  if (browFw > 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 1 / 3;
+    for (const g of [0.012, 0.03, 0.05]) paint(ctx, 'brows', P, '#00f', g * browFw);
+    ctx.globalAlpha = 1;
+  }
+  if (lashFw > 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 1 / 3;
+    ctx.strokeStyle = '#00f';
+    ctx.lineCap = ctx.lineJoin = 'round';
+    for (const g of [0.008, 0.016, 0.026]) {
+      ctx.lineWidth = g * lashFw;
+      for (const lid of LASH_LINES) {
+        // The wing: on along the eye's axis from the outer corner, and up,
+        // away from the line between the corners toward the lid's top.
+        const [ox, oy] = P(lid[0]), [ix, iy] = P(lid[lid.length - 1]), [tx, ty] = P(lid[4]);
+        const ux = tx - (ox + ix) / 2, uy = ty - (oy + iy) / 2;
+        ctx.beginPath();
+        ctx.moveTo(ox + 0.22 * (ox - ix) + 0.5 * ux, oy + 0.22 * (oy - iy) + 0.5 * uy);
+        for (const i of lid) ctx.lineTo(...P(i));
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
 }
+
+/** Each upper lid from the outer corner to the inner one. */
+const LASH_LINES = [
+  [33, 246, 161, 160, 159, 158, 157, 173, 133],
+  [263, 466, 388, 387, 386, 385, 384, 398, 362],
+];
 
 /**
  * Eye size: push points away from each iris centre, most near the centre and
@@ -452,6 +520,79 @@ function displace(out, amount, W, H) {
     }
   }
   return out;
+}
+
+// The filters' shapes, in the face's own frame (one unit the eye spacing, y
+// down). eyeX/eyeY, nose and mouthX/mouthY grow (+) or shrink (-) a feature
+// about its centre; jaw draws the lower face in (-) or out (+) toward the
+// midline; chin shortens (-) or lengthens (+) the face below the nose; brow
+// moves the brows up (-) or down (+); cheek fills the cheekbones out (+);
+// size grows (+) or shrinks (-) the whole face about the point between the
+// eyes. Sizes from facial dimorphism studies: men have wider jaws, longer
+// lower faces, lower brows and faces some 6% larger; women larger eyes,
+// fuller lips, smaller noses and fuller cheekbones over a narrower jaw. The
+// gender swap doubles the typical difference or so, to read at a glance.
+const SHAPES = {
+  anime: { eyeX: 0.28, eyeY: 0.5, nose: -0.45, mouthX: -0.4, mouthY: -0.25, jaw: -0.16, chin: -0.12, brow: -0.05, cheek: 0, size: 0 },
+  feminine: { eyeX: 0.08, eyeY: 0.12, nose: -0.14, mouthX: -0.04, mouthY: 0.24, jaw: -0.13, chin: -0.07, brow: -0.06, cheek: 0.07, size: -0.04 },
+  masculine: { eyeX: -0.05, eyeY: -0.08, nose: 0.08, mouthX: 0.05, mouthY: -0.2, jaw: 0.12, chin: 0.07, brow: 0.05, cheek: 0, size: 0.05 },
+};
+
+/**
+ * A filter's shape: move each point by a smooth field of where it is on the
+ * live face. Each part fades to nothing a little past its feature, and each
+ * is gentle enough that the mesh never folds. A blink or a smile still moves
+ * the face: the field acts on the live points, not on a fixed shape.
+ * L is the live points in the face's frame `fr`; d is moved in place.
+ */
+function reshape(d, L, fr, browW, k, amt, W, H) {
+  const at = i => [L[i * 2], L[i * 2 + 1]];
+  const mid = (a, b) => [(L[a * 2] + L[b * 2]) / 2, (L[a * 2 + 1] + L[b * 2 + 1]) / 2];
+  const dist = (a, b) => Math.hypot(L[a * 2] - L[b * 2], L[a * 2 + 1] - L[b * 2 + 1]);
+  // 1 at the centre, 0 at radius 1, as in displace(): never folds for |k| < 1.
+  const bump = u2 => (u2 < 1 ? (1 - u2) ** 2 : 0);
+  const smooth = t => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+  const eyes = [[33, 133], [362, 263]].map(([a, b]) => [...mid(a, b), 1.4 * dist(a, b)]);
+  const [mx, my] = mid(61, 291);
+  const mr = 0.8 * dist(61, 291);
+  const tip = at(1), top = at(168);
+  const nx = 0.35 * top[0] + 0.65 * tip[0], ny = 0.35 * top[1] + 0.65 * tip[1];
+  // Wide enough to take in the nostril wings (about 0.4 either side).
+  const nrx = 0.75, nry = 0.6 * Math.abs(tip[1] - top[1]) + 0.1;
+  const [chinX, chinY] = at(152);
+  const { ux, uy, s } = fr;
+  for (let i = 0; i < ALL_POINTS; i++) {
+    const x = L[i * 2], y = L[i * 2 + 1];
+    let dx = 0, dy = 0;
+    for (const [ex, ey, R] of eyes) {
+      const b = bump(((x - ex) ** 2 + (y - ey) ** 2) / (R * R));
+      dx += k.eyeX * b * (x - ex);
+      dy += k.eyeY * b * (y - ey);
+    }
+    let b = bump(((x - nx) / nrx) ** 2 + ((y - ny) / nry) ** 2);
+    dx += k.nose * b * (x - nx);
+    dy += k.nose * b * (y - ny);
+    b = bump(((x - mx) / mr) ** 2 + ((y - my) / (0.8 * mr)) ** 2);
+    dx += k.mouthX * b * (x - mx);
+    dy += k.mouthY * b * (y - my);
+    // The jaw, from the cheekbones down, toward the line from between the
+    // eyes to the chin. Nothing above the cheekbones moves.
+    const t = smooth((y - 0.2 * chinY) / (0.6 * chinY));
+    dx += k.jaw * (x - chinX * Math.min(1, Math.max(0, y / chinY))) * t * t;
+    // The lower face, from just above the nose tip: a ramp with no kink.
+    const u = y - tip[1] + 0.25;
+    if (u > 0) dy += k.chin * u * u / (u + 0.25);
+    dy += k.brow * browW[i];
+    // The cheekbones, out to the side, below and outside each eye.
+    dx += k.cheek * Math.sign(x) * bump(((Math.abs(x) - 0.95) ** 2 + (y - 0.45) ** 2) / 0.3);
+    dx += k.size * x;
+    dy += k.size * y;
+    dx *= amt;
+    dy *= amt;
+    d[i * 2] += s * (dx * ux - dy * uy) / W;
+    d[i * 2 + 1] += s * (dx * uy + dy * ux) / H;
+  }
+  return d;
 }
 
 /**
@@ -639,6 +780,18 @@ void main() {
   if (mirror > 0.5) uv.x = 1.0 - uv.x;
   gl_Position = vec4(p, 0.0, 1.0);
 }`;
+// The background around the face, as a grid: src is where a grid point is in
+// the camera image, pos where it is drawn, both 0..1 image coordinates.
+const VS_BGW = `
+attribute vec2 pos;
+attribute vec2 src;
+uniform float mirror;
+varying vec2 uv;
+void main() {
+  float x = mirror > 0.5 ? 1.0 - pos.x : pos.x;
+  gl_Position = vec4(x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
+  uv = src;
+}`;
 // Hair is recoloured first and the background goes behind the result, as a
 // person in front of a backdrop. The cartoon style and the grade come after
 // both, over the whole frame, so the mask's edge never shows as a seam.
@@ -714,16 +867,19 @@ void main() {
 }`;
 
 // The face, through the mesh. pos is where a point is drawn (after the eye
-// warp), lpos where it is in the camera image, tc where it is in the reference.
+// warp), lpos where it is in the camera image, tc where it is in the
+// reference, and fpos where it is in the live face's own frame (faceFrame).
 const VS_FACE = `
 attribute vec2 pos;
 attribute vec2 lpos;
 attribute vec2 tc;
+attribute vec2 fpos;
 attribute float a;
 uniform float mirror;
 varying vec2 dp;
 varying vec2 lp;
 varying vec2 uv;
+varying vec2 fc;
 varying float va;
 void main() {
   float x = mirror > 0.5 ? 1.0 - pos.x : pos.x;
@@ -731,6 +887,7 @@ void main() {
   dp = pos;
   lp = lpos;
   uv = tc;
+  fc = fpos;
   va = a;
 }`;
 const FS_FACE = `${PRECISION}${GRADE}${TOON}${TINT}${HAIR}
@@ -756,9 +913,12 @@ uniform vec3 lipColor;
 uniform vec3 eyeColor;
 uniform vec3 iris0;
 uniform vec3 iris1;
+// The filters' amounts: anime, feminine, masculine.
+uniform vec3 filt;
 varying vec2 dp;
 varying vec2 lp;
 varying vec2 uv;
+varying vec2 fc;
 varying float va;
 
 // The iris as a ring: the pupil in the middle stays dark.
@@ -767,6 +927,31 @@ float irisRing(vec3 ir, vec2 px) {
   // smoothstep needs edge0 < edge1 (reversed edges are undefined in GLSL ES),
   // so the outer fade is written as 1 - smoothstep.
   return (1.0 - smoothstep(ir.z * 0.9, ir.z * 1.08, d)) * smoothstep(ir.z * 0.3, ir.z * 0.45, d);
+}
+
+// A soft spot on both sides of the face at once, in the face's own frame:
+// the same place on the face at any size, position or roll.
+float spot(vec2 c, vec2 r) {
+  vec2 q = (vec2(abs(fc.x), fc.y) - c) / r;
+  return exp(-dot(q, q));
+}
+
+// Value noise with no texture: a hash of the cell corners, smoothly mixed.
+float hash(vec2 p) {
+  vec3 p3 = fract(p.xyx * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// A drawn catchlight: a small white disc up and to one side in the iris.
+float catchlight(vec3 ir, vec2 px) {
+  return 1.0 - smoothstep(ir.z * 0.15, ir.z * 0.25, distance(px, ir.xy + vec2(-0.32, -0.34) * ir.z));
 }
 
 void main() {
@@ -780,7 +965,8 @@ void main() {
     c = mix(c, sm, smoothAmt * texture2D(masks, dp).a * keep);
   }
 
-  vec2 feat = texture2D(maskX, dp).rg;
+  // Lips in red, eye openings in green, brows (masculine filter) in blue.
+  vec3 feat = texture2D(maskX, dp).rgb;
   vec2 px = dp * vsize;
   float iris = max(irisRing(iris0, px), irisRing(iris1, px));
 
@@ -814,6 +1000,38 @@ void main() {
 
   if (lipAmt > 0.0) c = tint(c, lipColor, lipAmt * feat.r, 0.35);
   if (eyeAmt > 0.0) c = tint(c, eyeColor, eyeAmt * feat.g * iris, 0.7);
+
+  // The filters' colour. A lip colour chosen in Edits wins over theirs.
+  if (filt.x + filt.y > 0.0) {
+    // Blush on the cheeks, eyes and lips left out.
+    float cheek = spot(vec2(0.72, 0.52), vec2(0.25, 0.17)) * (1.0 - feat.r) * (1.0 - feat.g);
+    c = mix(c, c * vec3(1.0, 0.72, 0.76), cheek * (0.5 * filt.x + 0.32 * filt.y));
+  }
+  if (filt.x > 0.0) {
+    // Anime: pink lips, and a catchlight in each eye.
+    if (lipAmt <= 0.0) c = tint(c, vec3(0.86, 0.42, 0.48), 0.3 * filt.x * feat.r, 0.35);
+    c = mix(c, vec3(1.0), 0.9 * filt.x * feat.g * max(catchlight(iris0, px), catchlight(iris1, px)));
+  }
+  if (filt.y > 0.0) {
+    // Feminine: rose lips, a soft eyeshadow on the upper lids, darker lashes
+    // with a small wing (blue in the mask), and a soft glow on the skin.
+    if (lipAmt <= 0.0) c = tint(c, vec3(0.8, 0.32, 0.4), 0.38 * filt.y * feat.r, 0.35);
+    c = mix(c, c * vec3(0.84, 0.72, 0.78), 0.45 * filt.y * spot(vec2(0.55, -0.15), vec2(0.24, 0.08)) * (1.0 - feat.g));
+    c = mix(c, c * 0.3, 0.75 * filt.y * feat.b * (1.0 - feat.g));
+    c = mix(c, 1.0 - (1.0 - c) * (1.0 - c), 0.16 * filt.y * texture2D(masks, dp).a);
+  }
+  if (filt.z > 0.0) {
+    // Masculine: darker, heavier brows, a shadow under the brow ridge, and
+    // stubble over the jaw, chin and upper lip: a shadow with a grain of
+    // dots fixed to the face, so it moves with the skin.
+    c = mix(c, c * 0.5, 0.55 * filt.z * feat.b);
+    c *= 1.0 - 0.2 * filt.z * spot(vec2(0.55, -0.24), vec2(0.28, 0.07)) * (1.0 - feat.g);
+    float ax = abs(fc.x);
+    float edge = ax < 0.45 ? mix(0.76, 0.86, ax / 0.45) : ax < 0.75 ? mix(0.86, 0.92, (ax - 0.45) / 0.3) : mix(0.92, 0.55, min((ax - 0.75) / 0.45, 1.0));
+    float beard = smoothstep(edge - 0.03, edge + 0.08, fc.y) * (1.0 - feat.r);
+    float grain = smoothstep(0.4, 0.8, noise(fc * 95.0));
+    c = mix(c, c * vec3(0.5, 0.5, 0.56), beard * filt.z * (0.26 + 0.38 * grain));
+  }
   c = applyHair(c, lp);
 
   // Where the mesh reaches past the face onto a blurred or replaced
@@ -870,6 +1088,7 @@ export class Renderer {
     this.gl = gl;
     this.mesh = mesh;
     this.bg = program(gl, VS_BG, FS_BG);
+    this.bgWarp = program(gl, VS_BGW, FS_BG);
     this.copyProg = program(gl, VS_QUAD, FS_COPY);
     this.blurProg = program(gl, VS_QUAD, FS_BLUR);
     this.packProg = program(gl, VS_QUAD, FS_PACK);
@@ -899,6 +1118,27 @@ export class Renderer {
     this.lineBuf = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.lineBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.lines, gl.STATIC_DRAW);
+    this.fposBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.fposBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(MESH_POINTS * 2), gl.DYNAMIC_DRAW);
+
+    // The background grid: (GRID + 1)^2 points, two triangles a cell.
+    const idx = [];
+    for (let r = 0; r < GRID; r++) {
+      for (let c = 0; c < GRID; c++) {
+        const a = r * (GRID + 1) + c;
+        idx.push(a, a + 1, a + GRID + 1, a + 1, a + GRID + 2, a + GRID + 1);
+      }
+    }
+    this.gridIdx = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.gridIdx);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+    this.gridCount = idx.length;
+    this.gridSrc = new Float32Array((GRID + 1) ** 2 * 2);
+    this.gridPos = new Float32Array((GRID + 1) ** 2 * 2);
+    this.gridSrcBuf = gl.createBuffer();
+    this.gridPosBuf = gl.createBuffer();
+    this.ovalPx = new Float32Array(mesh.oval.length * 4);
 
     this.disp = new Float32Array(ALL_POINTS * 2);
     this.lpos = new Float32Array(MESH_POINTS * 2);
@@ -1081,12 +1321,84 @@ export class Renderer {
   }
 
   /**
+   * Keep the outline's movement under EDGE_MAX face widths, over the outline
+   * and the three rings in from it, so the background can follow without
+   * folding. Smooth: half the limit is kept to 2%, and it never goes over.
+   */
+  capEdge(d, fw, W, H) {
+    const c = EDGE_MAX * fw;
+    for (const i of this.mesh.edge) {
+      const dx = (d[i * 2] - this.lpos[i * 2]) * W, dy = (d[i * 2 + 1] - this.lpos[i * 2 + 1]) * H;
+      const f = 1 / Math.sqrt(Math.sqrt(1 + (Math.hypot(dx, dy) / c) ** 4));
+      d[i * 2] = this.lpos[i * 2] + dx * f / W;
+      d[i * 2 + 1] = this.lpos[i * 2 + 1] + dy * f / H;
+    }
+  }
+
+  /**
+   * The background grid around the face, moved with the outline. A grid
+   * point moves by the Gaussian-weighted mean of the outline points'
+   * movement, divided by no less than the weight an outline point gets from
+   * its neighbours: on the outline it moves as the outline does, and four
+   * sigma away it does not move. Fills gridSrc and gridPos; false when the
+   * outline did not move.
+   */
+  warpBackground(d, fw, W, H) {
+    const o = this.mesh.oval, n = o.length, q = this.ovalPx;
+    const cap = EDGE_MAX * fw;
+    let moved = 0, x0 = W, y0 = H, x1 = 0, y1 = 0;
+    for (let k = 0; k < n; k++) {
+      const i = o[k];
+      const x = this.lpos[i * 2] * W, y = this.lpos[i * 2 + 1] * H;
+      let dx = d[i * 2] * W - x, dy = d[i * 2 + 1] * H - y;
+      const m = Math.hypot(dx, dy);
+      if (m > cap) { dx *= cap / m; dy *= cap / m; }
+      q[k * 4] = x; q[k * 4 + 1] = y; q[k * 4 + 2] = dx; q[k * 4 + 3] = dy;
+      moved = Math.max(moved, m);
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+    }
+    if (moved < 0.5) return false;
+    const sig = BG_SIGMA * fw, e = -1 / (2 * sig * sig);
+    let w0 = Infinity;
+    for (let a = 0; a < n; a++) {
+      let sum = 0;
+      for (let b = 0; b < n; b++) sum += Math.exp(((q[a * 4] - q[b * 4]) ** 2 + (q[a * 4 + 1] - q[b * 4 + 1]) ** 2) * e);
+      w0 = Math.min(w0, sum);
+    }
+    const pad = 4 * sig;
+    x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad);
+    x1 = Math.min(W, x1 + pad); y1 = Math.min(H, y1 + pad);
+    for (let r = 0, j = 0; r <= GRID; r++) {
+      const gy = y0 + (y1 - y0) * r / GRID;
+      for (let c = 0; c <= GRID; c++, j += 2) {
+        const gx = x0 + (x1 - x0) * c / GRID;
+        let sw = 0, sx = 0, sy = 0;
+        for (let k = 0; k < n; k++) {
+          const w = Math.exp(((gx - q[k * 4]) ** 2 + (gy - q[k * 4 + 1]) ** 2) * e);
+          sw += w; sx += w * q[k * 4 + 2]; sy += w * q[k * 4 + 3];
+        }
+        const div = Math.max(sw, w0);
+        this.gridSrc[j] = gx / W;
+        this.gridSrc[j + 1] = gy / H;
+        this.gridPos[j] = (gx + sx / div) / W;
+        this.gridPos[j + 1] = (gy + sy / div) / H;
+      }
+    }
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.gridSrcBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, this.gridSrc, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.gridPosBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, this.gridPos, gl.DYNAMIC_DRAW);
+    return true;
+  }
+
+  /**
    * One frame.
    * f: { mirror, points (478 live points or null), lumNorm, s (settings) }
    * s: { regions[], blend, refMode ('look'|'features'), refHair, smooth, eyeSize,
    *      eyeColor [r,g,b], eyeAmt, lipColor [r,g,b], lipAmt, toon,
    *      hairColor [r,g,b], hairAmt, bgBlur, bgColor [r,g,b], bgAmt,
-   *      warmth, brightness, contrast, saturation, showMesh }
+   *      warmth, brightness, contrast, saturation, filter, filterAmt, showMesh }
    */
   draw(video, f) {
     const gl = this.gl;
@@ -1100,6 +1412,15 @@ export class Renderer {
     const pts = f.points?.length >= ALL_POINTS ? f.points : null;
     const transfer = this.hasRef && s.blend > 0 && s.regions.length > 0;
     const swap = transfer && s.refMode === 'features' && this.refLocal;
+    // A filter adds to the edits, it does not replace them: anime and
+    // feminine smooth the skin at least this much, anime draws in the cartoon
+    // style at least this much, and masculine smooths less than asked.
+    const fa = SHAPES[s.filter] ? s.filterAmt : 0;
+    const anime = s.filter === 'anime' ? fa : 0;
+    const fem = s.filter === 'feminine' ? fa : 0;
+    const masc = s.filter === 'masculine' ? fa : 0;
+    const smooth = Math.max(s.smooth, 0.7 * anime, 0.5 * fem) * (1 - 0.7 * masc);
+    const toonAmt = Math.max(s.toon, 0.85 * anime);
     // Hair and background need a mask; until the segmenter has one, neither
     // shows. In a face swap the photo's hair colour, if asked for, replaces
     // the chosen one, at the swap's strength.
@@ -1111,13 +1432,25 @@ export class Renderer {
     let irisA = [0, 0, 0], irisB = [0, 0, 0];
     // With no face in view the cartoon style still needs a scale to work at.
     let fw = W / 4;
+    let bgWarped = false;
     if (!pts) this.rest = null;
     if (pts) {
       const d = flatten(pts, this.disp);
       for (let i = 0; i < MESH_POINTS * 2; i++) this.lpos[i] = d[i];
-      if (swap) this.morph(d, s.regions, s.blend, W, H);
-      displace(d, s.eyeSize, W, H);
       fw = faceWidth(pts, W, H);
+      // The live points in the face's own frame: the filter's field, and the
+      // face pass's place for the filter's colour.
+      const L = toLocal(d, W, H, this.liveLocal);
+      const fr = faceFrame(d, W, H);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.fposBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, L.subarray(0, MESH_POINTS * 2), gl.DYNAMIC_DRAW);
+      if (swap) this.morph(d, s.regions, s.blend, W, H);
+      // morph() leaves liveLocal as it found it: the live points.
+      if (fa > 0) reshape(d, L, fr, this.mesh.shape.brows, SHAPES[s.filter], fa, W, H);
+      // Only a filter moves the outline (a face swap keeps it, see buildMesh).
+      if (fa > 0) this.capEdge(d, fw, W, H);
+      displace(d, s.eyeSize, W, H);
+      if (fa > 0) bgWarped = this.warpBackground(d, fw, W, H);
       const Pq = i => [d[i * 2] * W / 4, d[i * 2 + 1] * H / 4];
       const Ph = i => [d[i * 2] * W / 2, d[i * 2 + 1] * H / 2];
 
@@ -1126,7 +1459,7 @@ export class Renderer {
         this.copy(this.videoTex, low);
         this.blur(low, this.target('tmpQ', W / 4, H / 4), fw * LOOK_BLUR / 4);
       }
-      if (s.smooth > 0) {
+      if (smooth > 0) {
         const sm = this.target('liveSmooth', W / 2, H / 2);
         this.copy(this.videoTex, sm);
         this.blur(sm, this.target('tmpH', W / 2, H / 2), fw / 70 / 2);
@@ -1141,19 +1474,19 @@ export class Renderer {
         this.upload(this.canvases.transfer, m);
         this.blur(m, this.target('tmpQ', W / 4, H / 4), 0.022 * fw / 4);
       }
-      if (transfer || s.smooth > 0) {
+      if (transfer || smooth > 0) {
         // Both masks in one texture, transfer in colour and skin in alpha, so
         // the face pass has a texture unit free for the segmentation mask.
         this.quadPass(this.packProg, transfer ? this.targets.maskT.tex : null, this.target('masks', W / 4, H / 4));
         gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, s.smooth > 0 ? this.targets.maskS.tex : null);
+        gl.bindTexture(gl.TEXTURE_2D, smooth > 0 ? this.targets.maskS.tex : null);
         gl.uniform1i(this.u(this.packProg, 'texB'), 1);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         gl.activeTexture(gl.TEXTURE0);
       }
-      if (s.lipAmt > 0 || s.eyeAmt > 0 || transfer) {
+      if (s.lipAmt > 0 || s.eyeAmt > 0 || transfer || fa > 0) {
         const c = this.canvases.feature;
-        drawFeatureMask(c, Math.round(W / 2), Math.round(H / 2), Ph);
+        drawFeatureMask(c, Math.round(W / 2), Math.round(H / 2), Ph, masc > 0 ? fw / 2 : 0, fem > 0 ? fw / 2 : 0);
         gl.bindTexture(gl.TEXTURE_2D, this.featureTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
       }
@@ -1165,7 +1498,7 @@ export class Renderer {
     // into one texture (B's brightness in A's alpha). The face pass already
     // uses seven texture units, and WebGL promises only eight.
     const T = this.targets;
-    if (s.toon > 0) {
+    if (toonAmt > 0) {
       const tmp = this.target('tmpH', W / 2, H / 2);
       const a = this.target('toonA', W / 2, H / 2);
       const b = this.target('toonB', W / 2, H / 2);
@@ -1181,9 +1514,9 @@ export class Renderer {
       gl.activeTexture(gl.TEXTURE0);
     }
     const toon = (prog, unit) => {
-      gl.uniform1f(this.u(prog, 'toonAmt'), s.toon);
+      gl.uniform1f(this.u(prog, 'toonAmt'), toonAmt);
       gl.activeTexture(gl.TEXTURE0 + unit);
-      gl.bindTexture(gl.TEXTURE_2D, s.toon > 0 ? T.toon.tex : null);
+      gl.bindTexture(gl.TEXTURE_2D, toonAmt > 0 ? T.toon.tex : null);
       gl.uniform1i(this.u(prog, 'toonT'), unit);
       gl.activeTexture(gl.TEXTURE0);
     };
@@ -1214,27 +1547,38 @@ export class Renderer {
     }
 
     // Background: the whole camera frame, with its hair and background
-    // effects, graded.
+    // effects, graded. Where the outline moved, the grid around the face is
+    // drawn over it, moved with the outline.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     const grade = [s.warmth, s.brightness, s.contrast, s.saturation];
-    this.useProgram(this.bg);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
-    gl.uniform1i(this.u(this.bg, 'tex'), 0);
-    gl.uniform1f(this.u(this.bg, 'mirror'), f.mirror ? 1 : 0);
-    gl.uniform4fv(this.u(this.bg, 'grade'), grade);
-    toon(this.bg, 1);
-    hair(this.bg, 2);
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, bgBlur > 0 ? T.bgLow.tex : null);
-    gl.uniform1i(this.u(this.bg, 'bgLow'), 3);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.uniform1f(this.u(this.bg, 'bgBlur'), bgBlur);
-    gl.uniform1f(this.u(this.bg, 'bgAmt'), bgAmt);
-    gl.uniform3fv(this.u(this.bg, 'bgColor'), s.bgColor);
+    const background = prog => {
+      this.useProgram(prog);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
+      gl.uniform1i(this.u(prog, 'tex'), 0);
+      gl.uniform1f(this.u(prog, 'mirror'), f.mirror ? 1 : 0);
+      gl.uniform4fv(this.u(prog, 'grade'), grade);
+      toon(prog, 1);
+      hair(prog, 2);
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, bgBlur > 0 ? T.bgLow.tex : null);
+      gl.uniform1i(this.u(prog, 'bgLow'), 3);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1f(this.u(prog, 'bgBlur'), bgBlur);
+      gl.uniform1f(this.u(prog, 'bgAmt'), bgAmt);
+      gl.uniform3fv(this.u(prog, 'bgColor'), s.bgColor);
+    };
+    background(this.bg);
     this.attrib(this.bg, 'p', this.quad, 2);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (bgWarped) {
+      background(this.bgWarp);
+      this.attrib(this.bgWarp, 'pos', this.gridPosBuf, 2);
+      this.attrib(this.bgWarp, 'src', this.gridSrcBuf, 2);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.gridIdx);
+      gl.drawElements(gl.TRIANGLES, this.gridCount, gl.UNSIGNED_SHORT, 0);
+    }
     if (!pts) return;
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
@@ -1268,7 +1612,8 @@ export class Renderer {
     gl.uniform1f(this.u(p, 'lumNorm'), f.lumNorm || 1);
     gl.uniform1f(this.u(p, 'irisOn'), transfer && (s.regions.includes('eyes') || s.regions.includes('face')) ? 1 : 0);
     gl.uniform3fv(this.u(p, 'refIris'), this.refIris || [0.3, 0.2, 0.15]);
-    gl.uniform1f(this.u(p, 'smoothAmt'), s.smooth);
+    gl.uniform1f(this.u(p, 'smoothAmt'), smooth);
+    gl.uniform3fv(this.u(p, 'filt'), [anime, fem, masc]);
     gl.uniform1f(this.u(p, 'lipAmt'), s.lipAmt);
     gl.uniform1f(this.u(p, 'eyeAmt'), s.eyeAmt);
     gl.uniform3fv(this.u(p, 'lipColor'), s.lipColor);
@@ -1279,6 +1624,7 @@ export class Renderer {
     this.attrib(p, 'pos', this.posBuf, 2);
     this.attrib(p, 'lpos', this.lposBuf, 2);
     this.attrib(p, 'tc', this.tcBuf, 2);
+    this.attrib(p, 'fpos', this.fposBuf, 2);
     this.attrib(p, 'a', this.alphaBuf, 1);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.triBuf);
     gl.drawElements(gl.TRIANGLES, this.mesh.tris.length, gl.UNSIGNED_SHORT, 0);

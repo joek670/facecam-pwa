@@ -61,6 +61,12 @@ justify-content:center;gap:10px;color:#e9eef1;text-align:center;padding:16px}
 .snap{width:60px;height:60px;border-radius:50%;padding:0;border:4px solid var(--text);
 background:var(--accent);min-height:0}
 .snap:active{transform:scale(.94)}
+.filterbar{display:flex;align-items:center;gap:12px;padding:0 0 10px}
+.filterbar select{flex:0 1 auto;min-width:0}
+#filtersliders{flex:1;min-width:0}
+.filterbar label{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--dim)}
+.filterbar input[type=range]{flex:1;min-width:0;accent-color:var(--accent);min-height:32px}
+.filterbar .val{min-width:2.8em;text-align:right;font-variant-numeric:tabular-nums}
 .ref{display:flex;align-items:center;gap:8px}
 .ref img{width:44px;height:44px;border-radius:10px;object-fit:cover;border:1px solid var(--line)}
 .ref input{display:none}
@@ -141,6 +147,16 @@ main > :not(.camwrap){grid-column:2}
     </div>
     <button class="snap" id="snap" aria-label="Take photo" disabled></button>
     <div class="right"><button id="flip" disabled>Flip</button></div>
+  </div>
+  <!-- Filters that need no photo, in view with the camera. -->
+  <div class="filterbar">
+    <select id="filter" aria-label="Filter">
+      <option value="none">No filter</option>
+      <option value="anime">Anime</option>
+      <option value="feminine">Gender swap: feminine</option>
+      <option value="masculine">Gender swap: masculine</option>
+    </select>
+    <div id="filtersliders"></div>
   </div>
   </div>
 
