@@ -23,7 +23,12 @@
  *   - a colour grade (warmth, brightness, contrast, saturation), applied to
  *     the face and the background alike so there is no seam.
  *
- * Everything runs on the device. The model and WASM come from the CDN once and
+ * A second model, MediaPipe Image Segmenter, sorts every pixel of the frame
+ * into hair, background, skin, clothes and others. The background pass uses
+ * it to recolour hair and to blur or replace the background, and the face
+ * pass recolours the hair it covers (a fringe) the same way.
+ *
+ * Everything runs on the device. The models and WASM come from the CDN once and
  * the service worker keeps them; no frame or photo leaves the browser.
  */
 
@@ -31,6 +36,21 @@ export const TASKS_VERSION = '0.10.14';
 const TASKS_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VERSION}`;
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const SEG_URL =
+  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite';
+// The multiclass model's classes, in this order (its model card):
+// background, hair, body skin, face skin, clothes, others.
+const SEG_BG = 0, SEG_HAIR = 1;
+// The segmenter sees 256 x 256 whatever it is given, so the camera frame is
+// scaled to this on its long side first. The masks come back the same size,
+// and reading two of them back from the GPU each frame is then cheap.
+const SEG_SIZE = 320;
+// The masks' feather, in mask pixels: enough that no effect has a hard edge,
+// little enough that the edge does not spread into a rim.
+const SEG_FEATHER = 0.8;
+// The darkest a recoloured hair pixel gets (see tint() in TINT). Higher than
+// lips: most hair is darker than lips, and at 0.35 dark hair barely changes.
+const HAIR_LIFT = 0.45;
 
 // The 468 mesh points. The iris points (468-477) are not part of the tesselation.
 const MESH_POINTS = 468;
@@ -50,12 +70,14 @@ export const REGIONS = ['face', 'eyes', 'brows', 'nose', 'lips'];
 
 let vision = null;
 let FaceLandmarker = null;
+let ImageSegmenter = null;
 let shapes = null;
 
 async function loadTasks() {
   if (vision) return;
   const mod = await import(`${TASKS_BASE}/vision_bundle.mjs`);
   FaceLandmarker = mod.FaceLandmarker;
+  ImageSegmenter = mod.ImageSegmenter;
   vision = await mod.FilesetResolver.forVisionTasks(`${TASKS_BASE}/wasm`);
 }
 
@@ -75,6 +97,107 @@ export async function createLandmarker(runningMode) {
   } catch (err) {
     console.warn('GPU delegate failed, using CPU', err);
     return FaceLandmarker.createFromOptions(vision, opts('CPU'));
+  }
+}
+
+/**
+ * A hair and background segmenter in 'IMAGE' or 'VIDEO' mode, GPU first.
+ * Confidence masks, not the category mask: a confidence is soft at the edge
+ * of a class (stray hairs are half hair), where a category is all or nothing.
+ */
+export async function createSegmenter(runningMode) {
+  await loadTasks();
+  const opts = delegate => ({
+    baseOptions: { modelAssetPath: SEG_URL, delegate },
+    runningMode,
+    outputConfidenceMasks: true,
+    outputCategoryMask: false,
+  });
+  try {
+    return await ImageSegmenter.createFromOptions(vision, opts('GPU'));
+  } catch (err) {
+    console.warn('GPU delegate failed, using CPU', err);
+    return ImageSegmenter.createFromOptions(vision, opts('CPU'));
+  }
+}
+
+// A confidence as a mask. The model rarely goes above 0.9 even where it is
+// sure (the rest is spread over the other five classes), and at 0.9 a
+// replaced background would still show a tenth of the real one. So lo + 0.5
+// and up counts as all, lo and down as none, with a smooth step between.
+function sure(c, lo) {
+  const t = Math.min(1, Math.max(0, (c - lo) * 2));
+  return t * t * (3 - 2 * t);
+}
+// The background's step starts lower, which moves its edge a pixel or so
+// into the person. Edge pixels are part real background; given to the
+// person, they would show it as a coloured rim around a replaced one.
+const SURE_HAIR = 0.25, SURE_BG = 0.1;
+
+/**
+ * Hair and background of one camera frame, as RGBA bytes: hair in red,
+ * background in green. `out` is reused when it is the right size.
+ * Returns { data, w, h }, in camera-image orientation like the video texture.
+ */
+export function segmentFrame(segmenter, source, sw, sh, canvas, out) {
+  const k = SEG_SIZE / Math.max(sw, sh);
+  const cw = Math.max(1, Math.round(sw * k)), ch = Math.max(1, Math.round(sh * k));
+  if (canvas.width !== cw) canvas.width = cw;
+  if (canvas.height !== ch) canvas.height = ch;
+  canvas.getContext('2d').drawImage(source, 0, 0, cw, ch);
+  let frame = null;
+  // The masks are valid only inside the callback, so they are read there.
+  segmenter.segmentForVideo(canvas, performance.now(), r => {
+    const bgMask = r.confidenceMasks[SEG_BG], hairMask = r.confidenceMasks[SEG_HAIR];
+    const w = bgMask.width, h = bgMask.height;
+    const bg = bgMask.getAsFloat32Array(), hair = hairMask.getAsFloat32Array();
+    const data = out?.length === w * h * 4 ? out : new Uint8ClampedArray(w * h * 4);
+    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+      data[j] = sure(hair[i], SURE_HAIR) * 255;
+      data[j + 1] = sure(bg[i], SURE_BG) * 255;
+      data[j + 3] = 255;
+    }
+    frame = { data, w, h };
+  });
+  return frame;
+}
+
+/**
+ * The reference photo's hair colour, as the tint that gives hair as bright
+ * as the photo's exactly that colour (see tint() in TINT), or null when the
+ * photo shows too little hair. Sampled once per photo, with a segmenter of
+ * its own in IMAGE mode that is closed after: the live one is in VIDEO mode.
+ */
+export async function referenceHair(image) {
+  const seg = await createSegmenter('IMAGE');
+  try {
+    const c = document.createElement('canvas');
+    c.width = image.width;
+    c.height = image.height;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0);
+    const px = ctx.getImageData(0, 0, c.width, c.height).data;
+    let r = 0, g = 0, b = 0, n = 0;
+    seg.segment(image, res => {
+      const m = res.confidenceMasks[SEG_HAIR];
+      const conf = m.getAsFloat32Array();
+      for (let y = 0; y < m.height; y++) {
+        const iy = Math.min(c.height - 1, Math.floor((y + 0.5) * c.height / m.height));
+        for (let x = 0; x < m.width; x++) {
+          // Only pixels that are surely hair: the edges are part background.
+          const w = conf[y * m.width + x];
+          if (w < 0.7) continue;
+          const k = (iy * c.width + Math.min(c.width - 1, Math.floor((x + 0.5) * c.width / m.width))) * 4;
+          r += px[k] * w; g += px[k + 1] * w; b += px[k + 2] * w; n += w;
+        }
+      }
+    });
+    if (n < 0.002 * c.width * c.height) return null;
+    const mean = [r / n / 255, g / n / 255, b / n / 255];
+    const lum = 0.299 * mean[0] + 0.587 * mean[1] + 0.114 * mean[2];
+    return mean.map(v => Math.min(1, v / (HAIR_LIFT + (1.75 - HAIR_LIFT) * lum)));
+  } finally {
+    seg.close();
   }
 }
 
@@ -466,13 +589,15 @@ vec3 applyGrade(vec3 c) {
 // blurred twice, B wider than A. A is the flat colour: pores and fine texture
 // gone. Where A is darker than B there is a dark edge, and that becomes an
 // ink line (a difference of Gaussians). Shading is cut into four soft bands.
+// ink scales the lines: the edges are the camera's, so a blurred or replaced
+// background must not show the real background's outlines.
 const TOON = `
 uniform float toonAmt;
 uniform sampler2D toonT;
 vec3 toonBase(vec3 c, vec2 p) {
   return toonAmt > 0.0 ? mix(c, texture2D(toonT, p).rgb, toonAmt) : c;
 }
-vec3 applyToon(vec3 c, vec2 p) {
+vec3 applyToon(vec3 c, vec2 p, float ink) {
   if (toonAmt <= 0.0) return c;
   float l = max(dot(c, LUMA), 0.002);
   float f = l * 4.0 + 0.35;
@@ -480,8 +605,28 @@ vec3 applyToon(vec3 c, vec2 p) {
   vec3 t = c * min(q / l, 3.0);
   t = mix(vec3(dot(t, LUMA)), t, 1.3);
   vec4 ab = texture2D(toonT, p);
-  t *= 1.0 - 0.82 * smoothstep(0.012, 0.035, ab.a - dot(ab.rgb, LUMA));
+  t *= 1.0 - 0.82 * ink * smoothstep(0.012, 0.035, ab.a - dot(ab.rgb, LUMA));
   return mix(c, clamp(t, 0.0, 1.0), toonAmt);
+}`;
+
+// Recolour keeping the light and shade of the original. lift is the
+// brightness of the darkest pixel: lips keep their shading at 0.35, but an
+// iris is near black, and at that lift a blue iris would stay near black.
+const TINT = `
+vec3 tint(vec3 c, vec3 t, float amt, float lift) {
+  vec3 col = t * (lift + (1.75 - lift) * dot(c, LUMA));
+  return mix(c, clamp(col, 0.0, 1.0), amt);
+}`;
+
+// Hair colour, from the segmentation mask (hair in red, background in
+// green), sampled at the pixel's place in the camera image. Both passes call
+// it the same way, so hair the face mesh covers and hair outside it match.
+const HAIR = `
+uniform sampler2D segT;
+uniform float hairAmt;
+uniform vec3 hairColor;
+vec3 applyHair(vec3 c, vec2 p) {
+  return hairAmt > 0.0 ? tint(c, hairColor, hairAmt * texture2D(segT, p).r, ${HAIR_LIFT.toFixed(2)}) : c;
 }`;
 
 // The camera image, full frame, for the background.
@@ -494,12 +639,33 @@ void main() {
   if (mirror > 0.5) uv.x = 1.0 - uv.x;
   gl_Position = vec4(p, 0.0, 1.0);
 }`;
-const FS_BG = `${PRECISION}${GRADE}${TOON}
+// Hair is recoloured first and the background goes behind the result, as a
+// person in front of a backdrop. The cartoon style and the grade come after
+// both, over the whole frame, so the mask's edge never shows as a seam.
+const FS_BG = `${PRECISION}${GRADE}${TOON}${TINT}${HAIR}
 uniform sampler2D tex;
+uniform sampler2D bgLow;
+uniform float bgBlur;
+uniform float bgAmt;
+uniform vec3 bgColor;
 varying vec2 uv;
 void main() {
-  vec3 c = toonBase(texture2D(tex, uv).rgb, uv);
-  gl_FragColor = vec4(applyGrade(applyToon(c, uv)), 1.0);
+  vec3 c = applyHair(toonBase(texture2D(tex, uv).rgb, uv), uv);
+  float fx = 0.0;
+  if (bgBlur > 0.0 || bgAmt > 0.0) {
+    float bg = texture2D(segT, uv).g;
+    // The blur's first quarter fades it in: even the smallest blur is a
+    // quarter-size image, and switching to it at once would be a jump.
+    float bw = min(bgBlur * 4.0, 1.0);
+    if (bgBlur > 0.0) {
+      // The background alone, blurred: colour times mask over the mask.
+      vec4 b = texture2D(bgLow, uv);
+      c = mix(c, b.rgb / max(b.a, 1.0 / 255.0), bg * bw);
+    }
+    c = mix(c, bgColor, bg * bgAmt);
+    fx = bg * max(bgBlur > 0.0 ? bw : 0.0, bgAmt);
+  }
+  gl_FragColor = vec4(applyGrade(applyToon(c, uv, 1.0 - fx)), 1.0);
 }`;
 
 // Offscreen passes keep image orientation: texture row t holds image row y = t,
@@ -519,6 +685,17 @@ uniform sampler2D tex;
 uniform sampler2D texB;
 varying vec2 uv;
 void main() { gl_FragColor = vec4(texture2D(tex, uv).rgb, dot(texture2D(texB, uv).rgb, LUMA)); }`;
+// The camera frame times the background mask, with the mask in alpha. Blurred
+// and divided by its alpha, it is the background blurred on its own: a plain
+// blur of the frame would smear the person's outline into it as a halo.
+const FS_BGMASK = `${PRECISION}
+uniform sampler2D tex;
+uniform sampler2D segT;
+varying vec2 uv;
+void main() {
+  float m = texture2D(segT, uv).g;
+  gl_FragColor = vec4(texture2D(tex, uv).rgb * m, m);
+}`;
 // One direction of a 13-tap Gaussian; dir is the tap spacing in texture units.
 const FS_BLUR = `${PRECISION}
 uniform sampler2D tex;
@@ -556,15 +733,16 @@ void main() {
   uv = tc;
   va = a;
 }`;
-const FS_FACE = `${PRECISION}${GRADE}${TOON}
+const FS_FACE = `${PRECISION}${GRADE}${TOON}${TINT}${HAIR}
 uniform sampler2D video;
 uniform sampler2D liveLow;
 uniform sampler2D liveSmooth;
 uniform sampler2D refLow;
-uniform sampler2D maskT;
-uniform sampler2D maskS;
+// The transfer mask in colour, the skin mask in alpha (packed in draw()).
+uniform sampler2D masks;
 uniform sampler2D maskX;
 uniform vec2 vsize;
+uniform float bgCut;
 uniform float hasRef;
 uniform float blend;
 uniform float swapMode;
@@ -583,13 +761,6 @@ varying vec2 lp;
 varying vec2 uv;
 varying float va;
 
-// Recolour keeping the light and shade of the original. lift is the
-// brightness of the darkest pixel: lips keep their shading at 0.35, but an
-// iris is near black, and at that lift a blue iris would stay near black.
-vec3 tint(vec3 c, vec3 t, float amt, float lift) {
-  vec3 col = t * (lift + (1.75 - lift) * dot(c, LUMA));
-  return mix(c, clamp(col, 0.0, 1.0), amt);
-}
 // The iris as a ring: the pupil in the middle stays dark.
 float irisRing(vec3 ir, vec2 px) {
   float d = distance(px, ir.xy);
@@ -606,7 +777,7 @@ void main() {
     // Edge-aware: where the blurred image differs a lot, there is an edge
     // (a wrinkle line stays soft, a jawline or nostril stays sharp).
     float keep = 1.0 - smoothstep(0.06, 0.2, distance(c, sm));
-    c = mix(c, sm, smoothAmt * texture2D(maskS, dp).r * keep);
+    c = mix(c, sm, smoothAmt * texture2D(masks, dp).a * keep);
   }
 
   vec2 feat = texture2D(maskX, dp).rg;
@@ -637,14 +808,18 @@ void main() {
     // The eye openings are left out: a gaze that differs from the photo's
     // would put its iris colour on the whites. The iris gets the photo's
     // iris colour on the live iris instead.
-    c = mix(c, looked, blend * texture2D(maskT, dp).r * (1.0 - feat.g));
+    c = mix(c, looked, blend * texture2D(masks, dp).r * (1.0 - feat.g));
     if (irisOn > 0.5) c = tint(c, refIris, blend * feat.g * iris, 0.7);
   }
 
   if (lipAmt > 0.0) c = tint(c, lipColor, lipAmt * feat.r, 0.35);
   if (eyeAmt > 0.0) c = tint(c, eyeColor, eyeAmt * feat.g * iris, 0.7);
+  c = applyHair(c, lp);
 
-  gl_FragColor = vec4(applyGrade(applyToon(c, lp)), va);
+  // Where the mesh reaches past the face onto a blurred or replaced
+  // background, the face fades out and the background pass shows instead.
+  float a = va * (1.0 - bgCut * texture2D(segT, lp).g);
+  gl_FragColor = vec4(applyGrade(applyToon(c, lp, 1.0)), a);
 }`;
 
 const VS_LINE = `
@@ -698,6 +873,7 @@ export class Renderer {
     this.copyProg = program(gl, VS_QUAD, FS_COPY);
     this.blurProg = program(gl, VS_QUAD, FS_BLUR);
     this.packProg = program(gl, VS_QUAD, FS_PACK);
+    this.bgMaskProg = program(gl, VS_QUAD, FS_BGMASK);
     this.face = program(gl, VS_FACE, FS_FACE);
     this.line = program(gl, VS_LINE, FS_LINE);
     this.videoTex = texture(gl);
@@ -733,6 +909,8 @@ export class Renderer {
     this.canvases = { transfer: document.createElement('canvas'), skin: document.createElement('canvas'),
       feature: document.createElement('canvas') };
     this.hasRef = false;
+    this.refHair = null;
+    this.segReady = false;
     this.enabled = new Set();
   }
 
@@ -840,7 +1018,28 @@ export class Renderer {
     this.hasRef = true;
   }
 
-  clearReference() { this.hasRef = false; this.refLocal = null; }
+  clearReference() { this.hasRef = false; this.refLocal = null; this.refHair = null; }
+
+  /** The photo's hair tint from referenceHair(), or null. Used in a face swap. */
+  setReferenceHair(t) { this.refHair = t; }
+
+  /**
+   * The hair and background masks of the latest segmented frame, from
+   * segmentFrame(). Feathered here, and kept until the next one, since the
+   * segmenter may skip frames.
+   */
+  setSegmentation({ data, w, h }) {
+    const gl = this.gl;
+    gl.disable(gl.BLEND);
+    const t = this.target('seg', w, h);
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    this.blur(t, this.target('segTmp', w, h), SEG_FEATHER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.segReady = true;
+  }
+
+  clearSegmentation() { this.segReady = false; }
 
   /** Per-point shape weight for the chosen areas: the most any of them allows. */
   shapeWeights(regions) {
@@ -884,8 +1083,9 @@ export class Renderer {
   /**
    * One frame.
    * f: { mirror, points (478 live points or null), lumNorm, s (settings) }
-   * s: { regions[], blend, refMode ('look'|'features'), smooth, eyeSize,
+   * s: { regions[], blend, refMode ('look'|'features'), refHair, smooth, eyeSize,
    *      eyeColor [r,g,b], eyeAmt, lipColor [r,g,b], lipAmt, toon,
+   *      hairColor [r,g,b], hairAmt, bgBlur, bgColor [r,g,b], bgAmt,
    *      warmth, brightness, contrast, saturation, showMesh }
    */
   draw(video, f) {
@@ -900,6 +1100,14 @@ export class Renderer {
     const pts = f.points?.length >= ALL_POINTS ? f.points : null;
     const transfer = this.hasRef && s.blend > 0 && s.regions.length > 0;
     const swap = transfer && s.refMode === 'features' && this.refLocal;
+    // Hair and background need a mask; until the segmenter has one, neither
+    // shows. In a face swap the photo's hair colour, if asked for, replaces
+    // the chosen one, at the swap's strength.
+    const seg = this.segReady;
+    const refHair = swap && s.refHair && this.refHair;
+    const hairAmt = !seg ? 0 : refHair ? s.blend : s.hairAmt;
+    const hairColor = refHair || s.hairColor;
+    const bgBlur = seg ? s.bgBlur : 0, bgAmt = seg ? s.bgAmt : 0;
     let irisA = [0, 0, 0], irisB = [0, 0, 0];
     // With no face in view the cartoon style still needs a scale to work at.
     let fw = W / 4;
@@ -932,6 +1140,16 @@ export class Renderer {
         drawTransferMask(this.canvases.transfer, m.w, m.h, Pq, fw / 4, s.regions);
         this.upload(this.canvases.transfer, m);
         this.blur(m, this.target('tmpQ', W / 4, H / 4), 0.022 * fw / 4);
+      }
+      if (transfer || s.smooth > 0) {
+        // Both masks in one texture, transfer in colour and skin in alpha, so
+        // the face pass has a texture unit free for the segmentation mask.
+        this.quadPass(this.packProg, transfer ? this.targets.maskT.tex : null, this.target('masks', W / 4, H / 4));
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, s.smooth > 0 ? this.targets.maskS.tex : null);
+        gl.uniform1i(this.u(this.packProg, 'texB'), 1);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.activeTexture(gl.TEXTURE0);
       }
       if (s.lipAmt > 0 || s.eyeAmt > 0 || transfer) {
         const c = this.canvases.feature;
@@ -969,8 +1187,34 @@ export class Renderer {
       gl.uniform1i(this.u(prog, 'toonT'), unit);
       gl.activeTexture(gl.TEXTURE0);
     };
+    const hair = (prog, unit) => {
+      gl.uniform1f(this.u(prog, 'hairAmt'), hairAmt);
+      gl.uniform3fv(this.u(prog, 'hairColor'), hairColor);
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, seg ? T.seg.tex : null);
+      gl.uniform1i(this.u(prog, 'segT'), unit);
+      gl.activeTexture(gl.TEXTURE0);
+    };
 
-    // Background: the whole camera frame, graded.
+    // Background blur, at quarter size, in two rounds: one Gaussian this
+    // wide would space its 13 taps too far apart and show them. Its width
+    // is a share of the frame, not of the face: it is the backdrop's blur.
+    if (bgBlur > 0) {
+      const low = this.target('bgLow', W / 4, H / 4);
+      const tmp = this.target('tmpQ', W / 4, H / 4);
+      this.quadPass(this.bgMaskProg, this.videoTex, low);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, T.seg.tex);
+      gl.uniform1i(this.u(this.bgMaskProg, 'segT'), 1);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.activeTexture(gl.TEXTURE0);
+      const sigma = bgBlur * Math.max(W, H) / 32 / 4 * Math.SQRT1_2;
+      this.blur(low, tmp, sigma);
+      this.blur(low, tmp, sigma);
+    }
+
+    // Background: the whole camera frame, with its hair and background
+    // effects, graded.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     const grade = [s.warmth, s.brightness, s.contrast, s.saturation];
@@ -981,6 +1225,14 @@ export class Renderer {
     gl.uniform1f(this.u(this.bg, 'mirror'), f.mirror ? 1 : 0);
     gl.uniform4fv(this.u(this.bg, 'grade'), grade);
     toon(this.bg, 1);
+    hair(this.bg, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, bgBlur > 0 ? T.bgLow.tex : null);
+    gl.uniform1i(this.u(this.bg, 'bgLow'), 3);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1f(this.u(this.bg, 'bgBlur'), bgBlur);
+    gl.uniform1f(this.u(this.bg, 'bgAmt'), bgAmt);
+    gl.uniform3fv(this.u(this.bg, 'bgColor'), s.bgColor);
     this.attrib(this.bg, 'p', this.quad, 2);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     if (!pts) return;
@@ -997,14 +1249,17 @@ export class Renderer {
     this.useProgram(p);
     const units = [
       ['video', this.videoTex], ['liveLow', T.liveLook?.tex], ['liveSmooth', T.liveSmooth?.tex],
-      ['refLow', T.refLook?.tex], ['maskT', T.maskT?.tex], ['maskS', T.maskS?.tex], ['maskX', this.featureTex],
+      ['refLow', T.refLook?.tex], ['masks', T.masks?.tex], ['maskX', this.featureTex],
     ];
     units.forEach(([name, tex], i) => {
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(gl.TEXTURE_2D, tex || null);
       gl.uniform1i(this.u(p, name), i);
     });
-    toon(p, units.length);
+    // Eight units in all, the most WebGL promises.
+    hair(p, units.length);
+    toon(p, units.length + 1);
+    gl.uniform1f(this.u(p, 'bgCut'), bgBlur > 0 || bgAmt > 0 ? 1 : 0);
     gl.uniform1f(this.u(p, 'mirror'), f.mirror ? 1 : 0);
     gl.uniform2f(this.u(p, 'vsize'), W, H);
     gl.uniform1f(this.u(p, 'hasRef'), transfer ? 1 : 0);

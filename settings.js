@@ -14,6 +14,8 @@ export const DEFAULTS = Object.freeze({
   refMode: 'look',
   regions: ['face'],
   blend: 0.85,
+  // In a face swap, also give the hair the photo's hair colour.
+  refHair: false,
   eyeColor: '#3f7fd0',
   eyeAmt: 0,
   lipColor: '#b8323f',
@@ -21,6 +23,12 @@ export const DEFAULTS = Object.freeze({
   smooth: 0,
   toon: 0,
   eyeSize: 0,
+  hairColor: '#a4532e',
+  hairAmt: 0,
+  // Blur, then a solid colour over it: bgAmt 1 hides the background entirely.
+  bgBlur: 0,
+  bgColor: '#3a6f8c',
+  bgAmt: 0,
   warmth: 0,
   brightness: 0,
   contrast: 0,
@@ -31,15 +39,20 @@ export const DEFAULTS = Object.freeze({
 // Number settings: [min, max]. Amounts are 0..1, grades -1..1 with 0 = no change.
 export const RANGES = {
   blend: [0, 1], eyeAmt: [0, 1], lipAmt: [0, 1], smooth: [0, 1], eyeSize: [0, 1], toon: [0, 1],
+  hairAmt: [0, 1], bgBlur: [0, 1], bgAmt: [0, 1],
   warmth: [-1, 1], brightness: [-1, 1], contrast: [-1, 1], saturation: [-1, 1],
 };
 
 export const LABELS = {
-  regions: 'From the photo', blend: 'Blend', eyeColor: 'Eye colour',
+  regions: 'From the photo', blend: 'Blend', refHair: "The photo's hair colour", eyeColor: 'Eye colour',
   eyeAmt: 'Eye colour', lipColor: 'Lip colour', lipAmt: 'Lip colour', smooth: 'Smooth skin',
-  eyeSize: 'Eye size', toon: 'Cartoon style', warmth: 'Warmth', brightness: 'Brightness', contrast: 'Contrast',
+  eyeSize: 'Eye size', toon: 'Cartoon style', hairColor: 'Hair colour', hairAmt: 'Hair colour',
+  bgBlur: 'Background blur', bgColor: 'Background colour', bgAmt: 'Background colour',
+  warmth: 'Warmth', brightness: 'Brightness', contrast: 'Contrast',
   saturation: 'Saturation', showMesh: 'Tracking mesh',
 };
+
+const COLOR_KEYS = ['eyeColor', 'lipColor', 'hairColor', 'bgColor'];
 
 export const REGION_LABELS = { face: 'Whole face', eyes: 'Eyes', brows: 'Brows', nose: 'Nose', lips: 'Lips' };
 
@@ -53,11 +66,11 @@ export function clean(patch) {
     if (k in RANGES && typeof v === 'number' && Number.isFinite(v)) {
       const [lo, hi] = RANGES[k];
       out[k] = Math.min(hi, Math.max(lo, v));
-    } else if ((k === 'eyeColor' || k === 'lipColor') && typeof v === 'string' && HEX.test(v)) {
+    } else if (COLOR_KEYS.includes(k) && typeof v === 'string' && HEX.test(v)) {
       out[k] = v.toLowerCase();
     } else if (k === 'refMode' && (v === 'look' || v === 'features')) {
       out[k] = v;
-    } else if (k === 'showMesh' && typeof v === 'boolean') {
+    } else if ((k === 'showMesh' || k === 'refHair') && typeof v === 'boolean') {
       out[k] = v;
     } else if (k === 'regions' && Array.isArray(v)) {
       out[k] = REGIONS.filter(r => v.includes(r));
@@ -77,11 +90,17 @@ export function describe(patch) {
   if ('regions' in p) lines.push(p.regions.length
     ? `From the photo: ${p.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ')}` : 'Nothing from the photo');
   if ('blend' in p) lines.push(`Blend ${pct(p.blend)}`);
-  if ('eyeAmt' in p || 'eyeColor' in p) lines.push(p.eyeAmt === 0 ? 'Eye colour off'
-    : `Eye colour ${p.eyeColor || ''} ${'eyeAmt' in p ? pct(p.eyeAmt) : ''}`.replace(/\s+/g, ' ').trim());
-  if ('lipAmt' in p || 'lipColor' in p) lines.push(p.lipAmt === 0 ? 'Lip colour off'
-    : `Lip colour ${p.lipColor || ''} ${'lipAmt' in p ? pct(p.lipAmt) : ''}`.replace(/\s+/g, ' ').trim());
-  for (const k of ['smooth', 'eyeSize', 'toon']) if (k in p) lines.push(`${LABELS[k]} ${pct(p[k])}`);
+  if ('refHair' in p) lines.push(p.refHair ? "The photo's hair colour (in Face swap)" : 'Own hair colour');
+  const colour = (amt, col, label) => {
+    if (!(amt in p || col in p)) return;
+    lines.push(p[amt] === 0 ? `${label} off`
+      : `${label} ${p[col] || ''} ${amt in p ? pct(p[amt]) : ''}`.replace(/\s+/g, ' ').trim());
+  };
+  colour('eyeAmt', 'eyeColor', 'Eye colour');
+  colour('lipAmt', 'lipColor', 'Lip colour');
+  colour('hairAmt', 'hairColor', 'Hair colour');
+  for (const k of ['smooth', 'eyeSize', 'toon', 'bgBlur']) if (k in p) lines.push(`${LABELS[k]} ${pct(p[k])}`);
+  colour('bgAmt', 'bgColor', 'Background colour');
   for (const k of ['warmth', 'brightness', 'contrast', 'saturation']) if (k in p) lines.push(`${LABELS[k]} ${signed(p[k])}`);
   if ('showMesh' in p) lines.push(p.showMesh ? 'Mesh on' : 'Mesh off');
   return lines;

@@ -72,7 +72,7 @@ display:grid;gap:12px}
 .panel .val{min-width:3.2em;text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
 .panel + .panel{margin-top:12px}
 .panel > div:empty{display:none}
-#refsliders,#editsliders,#lipsliders,#gradesliders{display:grid;gap:12px}
+#refsliders,#editsliders,#lipsliders,#gradesliders,#hairsliders,#bgsliders,#bgcolorsliders{display:grid;gap:12px}
 details.panel summary{cursor:pointer;font-weight:600;font-size:15.5px}
 details.panel:not([open]){display:block}
 .panel input[type=color]{width:52px;height:36px;padding:2px;border:1px solid var(--line);
@@ -164,6 +164,7 @@ main > :not(.camwrap){grid-column:2}
     </select></label>
     <div class="chips" id="regions" role="group" aria-label="Areas to take from the photo"></div>
     <div id="refsliders"></div>
+    <label><input id="refHair" type="checkbox"> Face swap: its hair colour too</label>
     <div><button id="clearref" type="button" disabled>Remove reference photo</button></div>
   </details>
 
@@ -178,11 +179,22 @@ main > :not(.camwrap){grid-column:2}
     <div><button id="reset" type="button">Reset edits</button></div>
   </details>
 
+  <details class="panel" open>
+    <summary>Hair and background</summary>
+    <label>Hair colour <input id="hairColor" type="color"></label>
+    <div id="hairsliders"></div>
+    <div id="bgsliders"></div>
+    <label>Background colour <input id="bgColor" type="color"></label>
+    <div id="bgcolorsliders"></div>
+    <div class="hint">These use a second on-device model, a 16 MB download the first time.</div>
+  </details>
+
   <h2>Shots</h2>
   <div class="shots" id="shots"></div>
   <p class="empty" id="noshots">Shots stay in this tab until you save or share them.</p>
 
-  <p class="foot">Face tracking uses Google MediaPipe Face Landmarker on this device. The
+  <p class="foot">Face tracking uses Google MediaPipe Face Landmarker, and hair and
+  background use MediaPipe Image Segmenter, on this device. The
   reference photo is kept in this browser only. Use someone's face only with their permission.</p>
 </main>
 <script type="module" src="app.js"></script>

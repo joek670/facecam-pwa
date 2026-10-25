@@ -1,7 +1,8 @@
 /* Face Cam — camera, reference photo, settings, capture and the render loop.
  * face.js holds the tracking and the rendering; settings.js the schema;
  * interpret.js turns "Describe a look" into settings. */
-import { createLandmarker, buildMesh, meanColor, skinTexture, Renderer, REGIONS } from './face.js';
+import { createLandmarker, createSegmenter, segmentFrame, referenceHair, buildMesh, meanColor, skinTexture,
+  Renderer, REGIONS } from './face.js';
 import { DEFAULTS, REGION_LABELS, clean, describe, rgb } from './settings.js';
 import { interpret } from './interpret.js';
 
@@ -12,7 +13,8 @@ const els = {
   refpick: $('refpick'), refthumb: $('refthumb'), reflabel: $('reflabel'), clearref: $('clearref'),
   notice: $('notice'), shots: $('shots'), noshots: $('noshots'),
   lookform: $('lookform'), look: $('look'), apply: $('apply'), via: $('via'), said: $('said'),
-  regions: $('regions'), refMode: $('refMode'), eyeColor: $('eyeColor'), lipColor: $('lipColor'),
+  regions: $('regions'), refMode: $('refMode'), refHair: $('refHair'), eyeColor: $('eyeColor'),
+  lipColor: $('lipColor'), hairColor: $('hairColor'), bgColor: $('bgColor'),
   showMesh: $('showMesh'), reset: $('reset'),
 };
 
@@ -20,9 +22,13 @@ const state = {
   videoLm: null, imageLm: null, renderer: null,
   stream: null, facing: 'user', running: false,
   livePoints: null, lastVideoTime: -1, frame: 0,
-  refPoints: null, refMean: null, liveMean: null,
+  refPoints: null, refMean: null, liveMean: null, refImg: null,
+  // The segmenter, and the photo's hair tint (null: none found or not asked).
+  segLm: null, segLoad: null, segFailed: false, segData: null, segMs: null, camFrame: 0,
+  refHairT: null, refHairFor: null,
 };
 const scratch = document.createElement('canvas');
+const segCanvas = document.createElement('canvas');
 
 function notice(msg, isErr = false) {
   els.notice.textContent = msg || '';
@@ -53,6 +59,9 @@ const SLIDERS = [
   ['smooth', 'Smooth skin', 'editsliders', false],
   ['toon', 'Cartoon style', 'editsliders', false],
   ['lipAmt', 'Lip colour amount', 'lipsliders', false],
+  ['hairAmt', 'Hair colour amount', 'hairsliders', false],
+  ['bgBlur', 'Background blur', 'bgsliders', false],
+  ['bgAmt', 'Background colour amount', 'bgcolorsliders', false],
   ['warmth', 'Warmth', 'gradesliders', true],
   ['brightness', 'Brightness', 'gradesliders', true],
   ['contrast', 'Contrast', 'gradesliders', true],
@@ -91,6 +100,11 @@ function buildControls() {
     ...(settings.eyeAmt === 0 ? { eyeAmt: 0.6 } : {}) }));
   els.lipColor.addEventListener('input', () => setSettings({ lipColor: els.lipColor.value,
     ...(settings.lipAmt === 0 ? { lipAmt: 0.55 } : {}) }));
+  els.hairColor.addEventListener('input', () => setSettings({ hairColor: els.hairColor.value,
+    ...(settings.hairAmt === 0 ? { hairAmt: 0.6 } : {}) }));
+  els.bgColor.addEventListener('input', () => setSettings({ bgColor: els.bgColor.value,
+    ...(settings.bgAmt === 0 ? { bgAmt: 1 } : {}) }));
+  els.refHair.addEventListener('change', () => setSettings({ refHair: els.refHair.checked }));
   els.showMesh.addEventListener('change', () => setSettings({ showMesh: els.showMesh.checked }));
   els.reset.addEventListener('click', () => {
     const { regions, blend, ...edits } = DEFAULTS;
@@ -106,8 +120,13 @@ function syncControls(skip) {
   }
   for (const b of els.regions.children) b.setAttribute('aria-pressed', settings.regions.includes(b.dataset.region));
   els.refMode.value = settings.refMode;
+  els.refHair.checked = settings.refHair;
+  // The photo's hair colour applies only in a face swap.
+  els.refHair.disabled = settings.refMode !== 'features';
   els.eyeColor.value = settings.eyeColor;
   els.lipColor.value = settings.lipColor;
+  els.hairColor.value = settings.hairColor;
+  els.bgColor.value = settings.bgColor;
   els.showMesh.checked = settings.showMesh;
 }
 
@@ -115,11 +134,13 @@ function setSettings(patch, { fromControl } = {}) {
   settings = { ...settings, ...clean(patch) };
   syncControls(fromControl);
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) {}
+  sampleRefHair();
 }
 
 /** The settings in the form the renderer takes. */
 function renderSettings() {
-  return { ...settings, eyeColor: rgb(settings.eyeColor), lipColor: rgb(settings.lipColor) };
+  return { ...settings, eyeColor: rgb(settings.eyeColor), lipColor: rgb(settings.lipColor),
+    hairColor: rgb(settings.hairColor), bgColor: rgb(settings.bgColor) };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +255,9 @@ async function setReference(blob, { save }) {
   state.refPoints = points;
   state.refMean = meanColor(img, points, img.width, img.height, scratch);
   state.renderer.setReference(img, points);
+  state.refImg = img;
+  state.refHairT = null;
+  state.renderer.setReferenceHair(null);
   els.refthumb.src = img.toDataURL('image/jpeg', 0.8);
   els.refthumb.classList.remove('hide');
   els.reflabel.textContent = 'Change';
@@ -246,12 +270,38 @@ async function setReference(blob, { save }) {
     setSettings({ refMode: 'features', toon: Math.max(settings.toon, 0.8) });
     notice('This face looks drawn, so Face swap and Cartoon style are on. Change either below.');
   }
+  sampleRefHair();
   if (save) await store.set('ref', blob);
+}
+
+/**
+ * The photo's hair colour, sampled once per photo, and only once Face swap
+ * with its hair colour is asked for: it needs the segmentation model, a
+ * download most looks never use.
+ */
+async function sampleRefHair() {
+  const img = state.refImg;
+  if (!img || state.refHairFor === img || !settings.refHair || settings.refMode !== 'features') return;
+  state.refHairFor = img;
+  let t = null;
+  try {
+    t = await referenceHair(img);
+  } catch (err) {
+    console.error(err);
+    notice('The hair and background model could not load. Check the connection and reload.', true);
+    return;
+  }
+  if (state.refImg !== img) return;
+  state.refHairT = t;
+  state.renderer.setReferenceHair(t);
+  if (!t) notice('No hair found in the reference photo, so your own hair colour stays.');
 }
 
 async function clearReference() {
   state.refPoints = null;
   state.refMean = null;
+  state.refImg = null;
+  state.refHairT = null;
   state.renderer?.clearReference();
   els.refthumb.classList.add('hide');
   els.refthumb.removeAttribute('src');
@@ -315,6 +365,49 @@ function stopCamera() {
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+/** Whether any setting needs the hair and background masks. */
+function segNeeded() {
+  return settings.hairAmt > 0 || settings.bgBlur > 0 || settings.bgAmt > 0
+    || Boolean(state.refHairT && settings.refHair && settings.refMode === 'features');
+}
+
+function loadSegmenter() {
+  if (state.segLoad) return;
+  state.segLoad = createSegmenter('VIDEO')
+    .then(s => { state.segLm = s; })
+    .catch(err => {
+      console.error(err);
+      state.segFailed = true;
+      notice('The hair and background model could not load. Check the connection and reload.', true);
+    });
+}
+
+/**
+ * Hair and background masks for this camera frame. The segmenter is a second
+ * model, loaded the first time a setting needs it, and run only while one
+ * does. When it takes more than 12 ms it runs on every other camera frame,
+ * and the frame between keeps the last masks.
+ */
+function segment(v) {
+  state.camFrame++;
+  if (!segNeeded() || state.segFailed) { state.renderer.clearSegmentation(); return; }
+  if (!state.segLm) { loadSegmenter(); return; }
+  if (state.segMs > 12 && state.camFrame % 2) return;
+  const t0 = performance.now();
+  try {
+    const m = segmentFrame(state.segLm, v, v.videoWidth, v.videoHeight, segCanvas, state.segData);
+    state.segData = m.data;
+    state.renderer.setSegmentation(m);
+  } catch (err) {
+    console.error(err);
+    state.segFailed = true;
+    notice('Hair and background effects failed on this device and are off.', true);
+    return;
+  }
+  const ms = performance.now() - t0;
+  state.segMs = state.segMs === null ? ms : state.segMs * 0.9 + ms * 0.1;
+}
+
 function loop() {
   const v = els.cam;
   if (v.readyState >= 2 && v.videoWidth) {
@@ -327,6 +420,7 @@ function loop() {
       state.lastVideoTime = v.currentTime;
       const r = state.videoLm.detectForVideo(v, performance.now());
       state.livePoints = r.faceLandmarks?.[0] || null;
+      segment(v);
     }
 
     // How much brighter the photo's face is overall than the live one, so the
@@ -349,7 +443,8 @@ function loop() {
       s: renderSettings(),
     });
     const areas = settings.regions.map(r => REGION_LABELS[r].toLowerCase()).join(', ');
-    els.status.textContent = !pts ? 'Looking for a face…'
+    els.status.textContent = segNeeded() && !state.segLm && !state.segFailed ? 'Loading the hair and background model…'
+      : !pts ? 'Looking for a face…'
       : !state.refPoints ? 'Face found.'
       : !settings.regions.length ? 'Face found. No areas chosen from the photo.'
       : settings.refMode === 'look' ? `The photo's look on: ${areas}.`

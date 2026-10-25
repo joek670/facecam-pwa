@@ -3,12 +3,14 @@
  * Two caches. The app shell is network-first, as in News Stack, so a redeploy
  * is picked up on the next launch and the cache is the offline fallback.
  *
- * The MediaPipe bundle, WASM and model are cache-first. Their URLs carry a
+ * The MediaPipe bundle, WASM and models are cache-first. Their URLs carry a
  * pinned version, so a cached copy is never stale, and they are ~14 MB that a
  * phone should download once, not on every launch. Caching them is what
- * makes the app work with no signal after the first good load.
+ * makes the app work with no signal after the first good load. The hair and
+ * background model (16 MB more) is fetched only when one of those effects is
+ * first used, and cached the same way from then on.
  */
-const SHELL = 'facecam-shell-5';
+const SHELL = 'facecam-shell-6';
 const MODEL = 'facecam-model-1';
 const ASSETS = [
   './', './index.html', './app.js', './face.js', './theme.js', './settings.js',
@@ -16,6 +18,8 @@ const ASSETS = [
   './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png',
   './icon-512.png',
 ];
+// URL prefixes. The second covers both models: face_landmarker/... and
+// image_segmenter/selfie_multiclass_256x256/float32/1/...
 const PINNED = [
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@',
   'https://storage.googleapis.com/mediapipe-models/',

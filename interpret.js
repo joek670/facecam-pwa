@@ -16,9 +16,18 @@ const COLORS = Object.entries({
   silver: '#b8c2c8', violet: '#7a4fc2', purple: '#7a3fa0', red: '#c0202d', pink: '#e0708f',
   coral: '#ef6f5a', nude: '#c58b78', berry: '#8e2045', plum: '#6e2a4e', wine: '#6d1a2a',
   orange: '#e07020', black: '#202020',
+  // Hair colours, and plain colours for a backdrop.
+  'jet black': '#141414', 'platinum blonde': '#e8dcc0', 'strawberry blonde': '#d39a6a', blonde: '#d8b46a',
+  blond: '#d8b46a', platinum: '#e8dcc0', auburn: '#8b3a1e', copper: '#b5562a', ginger: '#c0602a',
+  brunette: '#4a2c1a', teal: '#2a8f8f', lilac: '#b39ad6', lavender: '#a78bd0', white: '#f2f2f2',
+  yellow: '#e8c832', cyan: '#33b5c8',
 }).sort((a, b) => b[0].length - a[0].length);
 
 const PHOTO = /\b(reference|photo|picture|pic|their|his|her|swap|copy|transfer|like the|makeup|make-up)\b/;
+
+// Clause words within a comma-separated part.
+const SUB = /\band\b|\bwith\b|\bplus\b|\bthen\b/;
+const HAIR_BG = /\b(hair|background|backdrop|bokeh|portrait mode)\b/;
 
 const REGION_WORDS = [
   [/\b(whole face|full face|face ?swap|entire face|face)\b/, 'face'],
@@ -61,23 +70,26 @@ export function parseLocal(text) {
   }
 
   // A comma-separated part that names the photo is a transfer request, and
-  // every feature in it counts: "eyes and brows from my photo".
+  // every feature in it counts: "eyes and brows from my photo". Its hair and
+  // background clauses are left out of that: in "face swap and remove the
+  // background" the "remove" is the background's, and the face stays.
   const clauses = [];
   for (const part of all.split(/[,.;\n]/)) {
     const photo = PHOTO.test(part);
-    if (photo) {
-      if (/\b(swap|features?|transfer|their (face|eyes|nose|lips))\b/.test(part)) patch.refMode = 'features';
-      else if (/\b(look|makeup|make-up|style|vibe|tone)\b/.test(part)) patch.refMode = 'look';
-      const regions = REGION_WORDS.filter(([re]) => re.test(part)).map(([, r]) => r);
+    const own = part.split(SUB).filter(s => !HAIR_BG.test(s)).join(' ');
+    if (photo && PHOTO.test(own)) {
+      if (/\b(swap|features?|transfer|their (face|eyes|nose|lips))\b/.test(own)) patch.refMode = 'features';
+      else if (/\b(look|makeup|make-up|style|vibe|tone)\b/.test(own)) patch.refMode = 'look';
+      const regions = REGION_WORDS.filter(([re]) => re.test(own)).map(([, r]) => r);
       if (regions.length) {
-        patch.regions = /\b(no|without|remove)\b/.test(part) ? [] : regions;
-        const amt = intensity(takeColor(part)[1]);
+        patch.regions = /\b(no|without|remove)\b/.test(own) ? [] : regions;
+        const amt = intensity(takeColor(own)[1]);
         if (amt !== null) patch.blend = amt;
-      } else if (/\b(nothing|none|no|stop|remove|without)\b/.test(part)) {
+      } else if (/\b(nothing|none|no|stop|remove|without)\b/.test(own)) {
         patch.regions = [];
       }
     }
-    for (const raw of part.split(/\band\b|\bwith\b|\bplus\b|\bthen\b/)) clauses.push([raw, photo]);
+    for (const raw of part.split(SUB)) clauses.push([raw, photo]);
   }
 
   for (const [raw, photoPart] of clauses) {
@@ -94,6 +106,31 @@ export function parseLocal(text) {
     // "Anime eyes" is the eye size below, not the whole style.
     if (/\b(anime|manga|cartoon|toon|comic|cel[- ]?shad(ed|ing)|drawn|drawing)\b(?!\s+eyes?\b)/.test(t)) {
       patch.toon = off ? 0 : amt ?? 0.8; hit = true;
+    }
+
+    // Hair and background clauses are read here and nowhere else: "dark
+    // hair" or "a bright background" is not a grade of the whole picture.
+    if (/\bhair\b/.test(t)) {
+      if (fromPhoto) patch.refHair = !off;
+      else if (off || /\b(natural|own|real|normal)\b/.test(t)) patch.hairAmt = 0;
+      else if (color) { patch.hairColor = color; patch.hairAmt = amt ?? 0.6; }
+      else if (!hit) unknown.push(raw.trim());
+      continue;
+    }
+    if (/\b(background|backdrop|bokeh|portrait mode)\b/.test(t)) {
+      const blurry = /\b(blur(red|ry)?|bokeh|portrait mode|out of focus|soft(en)?)\b/.test(t);
+      // "Keep my background" is no effect; "keep the background blur" is no change.
+      const keep = /\b(keep|normal|real|original)\b/.test(t);
+      const stop = /\b(no|without|turn off|stop)\b/.test(t) || (keep && !blurry && !color);
+      if (blurry && !(keep && !stop)) patch.bgBlur = stop ? 0 : amt ?? 0.6;
+      // "Remove the background" replaces it with a plain colour.
+      if (color && !stop) { patch.bgColor = color; patch.bgAmt = amt ?? 1; }
+      else if (!blurry && stop) {
+        patch.bgAmt = 0;
+        if (!/\bcolou?r\b/.test(t)) patch.bgBlur = 0;
+      } else if (!blurry && /\b(remove|replace|hide|erase|plain|solid|green ?screen)\b/.test(t)) patch.bgAmt = amt ?? 1;
+      else if (!blurry && !hit) unknown.push(raw.trim());
+      continue;
     }
 
     if (!fromPhoto && /\b(eyes?|iris(es)?|eye colou?r)\b/.test(t) && (color || off) && !/\b(big|bigger|large|larger)\b/.test(t)) {

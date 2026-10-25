@@ -31,9 +31,16 @@ text only.
 
   The photo is kept in this browser (IndexedDB) and is still set after a
   relaunch.
+  In Face swap, **its hair colour too** gives your hair the photo's hair
+  colour as well.
 - **Edits, no reference needed:** eye colour, lip colour, skin smoothing, eye
   size, and a cartoon style for the whole picture. A colour grade (warmth, brightness, contrast, saturation) applies
   to the whole image.
+- **Hair and background:** a hair colour that keeps the hair's own light and
+  shade; a background blur, like a portrait mode; and a solid background
+  colour that replaces the background. The cartoon style and the colour
+  grade apply over these too. They use a second model, downloaded (16 MB)
+  the first time one of them is turned on.
 - **Describe a look:** type what you want; the app sets the controls and says
   what it understood and what it did not. The sliders stay the source of
   truth, so you can adjust after.
@@ -80,15 +87,46 @@ face through it each frame in WebGL. One pass does all the face work:
 - **Skin smoothing:** edge-aware; it softens skin but leaves edges such as the
   jaw and nostrils sharp, and it skips the eyes, brows, and mouth.
 
-The model and the WASM runtime come from Google's storage and jsDelivr, pinned
-to `@mediapipe/tasks-vision@0.10.14`. The service worker keeps them after the
-first load (about 14 MB).
+Hair and background come from a second model,
+[MediaPipe Image Segmenter](https://ai.google.dev/edge/mediapipe/solutions/vision/image_segmenter)
+with `selfie_multiclass_256x256`, which gives every pixel a confidence for
+background, hair, body skin, face skin, clothes, and others. It runs in VIDEO
+mode on the camera frame scaled to 320 pixels on its long side (the model works
+at 256 x 256 anyway), and on every other frame when it takes longer than 12 ms.
+The hair and background confidences are uploaded as one more texture and
+feathered with a small blur.
+
+- **Hair colour:** the same recolour as the lips, which keeps the hair's light
+  and shade, weighted by the hair confidence. The background pass does it for
+  the whole frame and the face pass for the hair the face mesh covers, with
+  the same formula, so a fringe matches the rest of the hair.
+- **Background blur:** the frame times the background confidence is blurred
+  at quarter size and divided by the confidence blurred the same way, so the
+  background is blurred on its own and the person's outline does not smear
+  into it.
+- **Background colour:** a solid colour mixed in by the background
+  confidence. The cartoon style's ink lines are left off a blurred or
+  replaced background: they come from the camera image and would draw the
+  real background's outlines.
+- **The photo's hair colour (Face swap):** the photo's surely-hair pixels are
+  averaged once, when the option is first on, and turned into the tint that
+  gives hair as bright as the photo's exactly that colour.
+
+The face pass uses eight texture units, the most WebGL promises: the
+transfer and skin masks share one texture so that the segmentation mask
+gets a unit of its own.
+
+The models and the WASM runtime come from Google's storage and jsDelivr,
+pinned to `@mediapipe/tasks-vision@0.10.14`. The service worker keeps them
+after the first load (about 14 MB, and 16 MB more once hair or background is
+used).
 
 ## Describe a look
 
 With no interpreter configured, `interpret.js` reads the text on the device
 with a fixed word list: colours, "from my photo", "slightly", "very",
-percentages, "black and white", "no lipstick", and similar.
+percentages, "black and white", "no lipstick", "blonde hair", "blur the
+background", "white background", and similar.
 
 With the Worker in `worker/` deployed (see [DEPLOY.md](DEPLOY.md), step 3),
 Claude reads the text and fills in the settings schema, which handles loose
@@ -105,7 +143,7 @@ the schema.
 | --- | --- |
 | `index.html` | Layout, styles, and the Content Security Policy |
 | `app.js` | Camera, reference photo, controls, render loop, capture |
-| `face.js` | Face Landmarker set-up, the mesh, feature masks, and the WebGL renderer |
+| `face.js` | Face Landmarker and Image Segmenter set-up, the mesh, feature masks, and the WebGL renderer |
 | `settings.js` | Settings defaults, limits, validation, and read-back text |
 | `interpret.js` | "Describe a look": the on-device word list and the Worker call |
 | `config.js` | The interpreter URL (empty: on-device only) |
